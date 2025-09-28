@@ -125,7 +125,7 @@ class VideoProcessor:
 
         crop_keyframes = []
 
-        for shot in shots:
+        for shot_idx, shot in enumerate(shots):
             keyframes = shot.get('keyframes', [])
 
             if not keyframes:
@@ -138,9 +138,19 @@ class VideoProcessor:
 
             # Convert each keyframe to CropKeyframe
             for i, kf in enumerate(keyframes):
-                timestamp = kf['timestamp']
-                center = kf['center']
-                zoom = kf.get('zoom', 1.0)
+                timestamp = kf.get('timestamp', shot['start_time'] + i * 1.0)
+
+                # Safely handle center - could be array or missing
+                center = kf.get('center', [0.5, 0.5])
+                if not isinstance(center, (list, tuple)) or len(center) < 2:
+                    logger.warning(f"Invalid center format in keyframe: {center}, using default [0.5, 0.5]")
+                    center = [0.5, 0.5]
+
+                zoom = max(0.5, min(2.0, float(kf.get('zoom', 1.0))))  # Limit zoom to reasonable range
+
+                # Ensure center values are within bounds
+                center[0] = max(0.0, min(1.0, float(center[0])))
+                center[1] = max(0.0, min(1.0, float(center[1])))
 
                 # Calculate crop region for 9:16 output
                 # Original is 16:9, target is 9:16 (56.25% of width)
@@ -153,11 +163,11 @@ class VideoProcessor:
 
                 crop_keyframe = CropKeyframe(
                     timestamp=timestamp,
-                    left=left,
-                    top=top,
-                    width=crop_width,
-                    height=crop_height,
-                    is_cut=(i == 0 and shot.get('transition_to_next') == 'cut')
+                    center_x=center[0],
+                    center_y=center[1],
+                    is_cut=(i == 0 and shot.get('transition_to_next') == 'cut'),
+                    confidence=shot.get('confidence', 0.8),
+                    reason=kf.get('description', f"Shot {shot_idx + 1} keyframe {i + 1}")
                 )
 
                 crop_keyframes.append(crop_keyframe)

@@ -17,6 +17,14 @@ class GeminiService:
         genai.configure(api_key=settings.GEMINI_API_KEY)
         self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
 
+        # Permissive safety settings to avoid blocks on video analysis
+        self.safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+
         # Rate limiting
         self.last_request_time = 0
         self.min_request_interval = 1.0  # 1 second between requests
@@ -275,40 +283,12 @@ class GeminiService:
 
         for attempt in range(self.max_retries):
             try:
-                # Generation config optimized for video analysis
-                generation_config = {
-                    'temperature': 0.3,
-                    'top_p': 0.95,
-                    'max_output_tokens': 8192  # Larger token limit for video analysis
-                }
-
-                # Use BLOCK_ONLY_HIGH for safety settings
-                safety_settings = [
-                    {
-                        "category": "HARM_CATEGORY_HARASSMENT",
-                        "threshold": "BLOCK_ONLY_HIGH"
-                    },
-                    {
-                        "category": "HARM_CATEGORY_HATE_SPEECH",
-                        "threshold": "BLOCK_ONLY_HIGH"
-                    },
-                    {
-                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                        "threshold": "BLOCK_ONLY_HIGH"
-                    },
-                    {
-                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                        "threshold": "BLOCK_ONLY_HIGH"
-                    }
-                ]
-
-                # Call Gemini with video and prompt
+                # Use permissive safety settings to avoid content blocks
                 response = await asyncio.to_thread(
                     self.model.generate_content,
                     [prompt, video_file],
-                    generation_config=generation_config,
-                    safety_settings=safety_settings,
-                    request_options={"timeout": 1800}  # 30 minute timeout for video processing
+                    safety_settings=self.safety_settings,
+                    request_options={"timeout": 1800}  # 30 minute timeout like TEGNA
                 )
 
                 self.last_request_time = time.time()
@@ -358,14 +338,14 @@ class GeminiService:
         height = metadata.get('height', 1080)
 
         prompt = f"""
-        Analyze this video for intelligent reframing from 16:9 horizontal to 9:16 vertical format.
+        Professional Video Analysis Task: Analyze this video for technical reframing from 16:9 horizontal to 9:16 vertical format.
 
-        Video specs:
+        Technical Specifications:
         - Duration: {duration} seconds
         - Resolution: {width}x{height}
         - Target output: 9:16 vertical video (56.25% of original width)
 
-        Provide a complete shot-by-shot reframing plan:
+        Provide a structured shot-by-shot reframing analysis:
 
         {{
             "shots": [
@@ -434,6 +414,13 @@ class GeminiService:
 
             if json_start >= 0 and json_end > json_start:
                 json_str = response_text[json_start:json_end]
+
+                # Try to repair JSON if it's malformed
+                repaired_json = self.repair_truncated_json(json_str)
+                if repaired_json:
+                    json_str = repaired_json
+                    logger.info("Successfully repaired JSON response")
+
                 reframing_data = json.loads(json_str)
 
                 if isinstance(reframing_data, dict) and 'shots' in reframing_data:
@@ -546,37 +533,133 @@ class GeminiService:
             # Try to parse as-is first
             json.loads(json_str)
             return json_str
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            logger.warning(f"Attempting to repair JSON, error at position {e.pos}: {e.msg}")
 
         # Common fixes for truncated JSON
         fixed = json_str.strip()
 
-        # Fix unclosed arrays
-        if fixed.startswith('[') and not fixed.endswith(']'):
-            # Count opening vs closing brackets
-            open_brackets = fixed.count('[')
-            close_brackets = fixed.count(']')
-            if open_brackets > close_brackets:
-                fixed += ']' * (open_brackets - close_brackets)
+        # Try multiple repair strategies
+        for strategy in range(3):
+            if strategy == 0:
+                # Strategy 1: Fix missing commas and trailing issues
+                test_fixed = self._fix_missing_commas(fixed)
+            elif strategy == 1:
+                # Strategy 2: Truncate at error position and close properly
+                test_fixed = self._truncate_and_close(fixed)
+            else:
+                # Strategy 3: Find last valid JSON structure
+                test_fixed = self._find_last_valid_structure(fixed)
 
-        # Fix unclosed objects
-        if fixed.startswith('{') and not fixed.endswith('}'):
-            open_braces = fixed.count('{')
-            close_braces = fixed.count('}')
-            if open_braces > close_braces:
-                fixed += '}' * (open_braces - close_braces)
+            if test_fixed:
+                try:
+                    json.loads(test_fixed)
+                    logger.info(f"Successfully repaired JSON using strategy {strategy + 1}")
+                    return test_fixed
+                except json.JSONDecodeError:
+                    continue
 
-        # Fix trailing commas
+        logger.warning("Could not repair JSON with any strategy")
+        return None
+
+    def _fix_missing_commas(self, json_str: str) -> str:
+        """Fix missing commas and basic structural issues"""
+        fixed = json_str.strip()
+
+        # Fix trailing commas before closing
         fixed = fixed.replace(',]', ']').replace(',}', '}')
 
-        try:
-            json.loads(fixed)
-            logger.info("Successfully repaired truncated JSON")
-            return fixed
-        except json.JSONDecodeError:
-            logger.warning("Could not repair truncated JSON")
-            return None
+        # Remove incomplete final array/object elements
+        fixed = fixed.rstrip(',')
+
+        # Count and fix unclosed brackets/braces
+        open_brackets = fixed.count('[')
+        close_brackets = fixed.count(']')
+        open_braces = fixed.count('{')
+        close_braces = fixed.count('}')
+
+        # Add missing closing brackets
+        if open_brackets > close_brackets:
+            fixed += ']' * (open_brackets - close_brackets)
+
+        # Add missing closing braces
+        if open_braces > close_braces:
+            fixed += '}' * (open_braces - close_braces)
+
+        return fixed
+
+    def _truncate_and_close(self, json_str: str) -> str:
+        """Truncate at problematic position and close properly"""
+        # Find the last complete object or array element
+        lines = json_str.split('\n')
+
+        # Work backwards to find last complete element
+        for i in range(len(lines) - 1, -1, -1):
+            line = lines[i].strip()
+            if line.endswith('},') or line.endswith('}'):
+                # Found a complete object, truncate here
+                truncated = '\n'.join(lines[:i+1])
+
+                # Remove trailing comma if present
+                if truncated.rstrip().endswith(','):
+                    truncated = truncated.rstrip()[:-1]
+
+                # Close any open structures
+                open_brackets = truncated.count('[') - truncated.count(']')
+                open_braces = truncated.count('{') - truncated.count('}')
+
+                if open_brackets > 0:
+                    truncated += ']' * open_brackets
+                if open_braces > 0:
+                    truncated += '}' * open_braces
+
+                return truncated
+
+        return json_str
+
+    def _find_last_valid_structure(self, json_str: str) -> str:
+        """Find the last valid JSON structure and build from there"""
+        # Try to find the shots array and work with that
+        shots_start = json_str.find('"shots": [')
+        if shots_start == -1:
+            return json_str
+
+        # Find the end of the shots array
+        bracket_count = 0
+        in_string = False
+        escape_next = False
+        shots_content = ""
+
+        start_pos = shots_start + len('"shots": ')
+
+        for i, char in enumerate(json_str[start_pos:], start_pos):
+            if escape_next:
+                escape_next = False
+                continue
+
+            if char == '\\':
+                escape_next = True
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if not in_string:
+                if char == '[':
+                    bracket_count += 1
+                elif char == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        # Found the end of shots array
+                        shots_content = json_str[start_pos:i+1]
+                        break
+
+        if shots_content:
+            # Build a minimal valid JSON with just the shots
+            return f'{{"shots": {shots_content}, "overall_strategy": "repaired", "confidence": 0.8}}'
+
+        return json_str
 
     def parse_shot_detection_response(self, response_text: str, duration: float) -> List[Dict]:
         """Parse shot detection response into shot boundaries"""
@@ -677,6 +760,7 @@ class GeminiService:
             response = await asyncio.to_thread(
                 self.model.generate_content,
                 test_prompt,
+                safety_settings=self.safety_settings,
                 generation_config=generation_config
             )
 

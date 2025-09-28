@@ -50,8 +50,17 @@ class FFmpegService:
         # Calculate output dimensions (9:16 aspect ratio)
         input_width = metadata['width']
         input_height = metadata['height']
+        # Calculate 9:16 aspect ratio, ensure even numbers for FFmpeg compatibility
         output_width = int(input_height * 9 / 16)
         output_height = input_height
+
+        # Ensure even dimensions (FFmpeg requirement)
+        if output_width % 2 != 0:
+            output_width -= 1
+        if output_height % 2 != 0:
+            output_height -= 1
+
+        logger.info(f"Output resolution: {output_width}x{output_height} (from {input_width}x{input_height})")
 
         # Ensure output width doesn't exceed input width
         if output_width > input_width:

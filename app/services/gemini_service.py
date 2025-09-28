@@ -225,6 +225,11 @@ class GeminiService:
     ) -> str:
         """Call Gemini API with retry logic and rate limiting"""
 
+        # Check fast-fail first
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            self.consecutive_failures += 1  # Continue counting
+            raise Exception(f"Fast-failing after {self.consecutive_failures} consecutive Gemini failures")
+
         # Rate limiting
         current_time = time.time()
         time_since_last = current_time - self.last_request_time
@@ -248,30 +253,30 @@ class GeminiService:
                 # Add text prompt
                 parts.append(prompt)
 
-                # Call Gemini
+                # Call Gemini with less restrictive safety settings
                 generation_config = {
                     'temperature': 0.2 if is_classification else 0.3,
                     'top_p': 0.95,
                     'max_output_tokens': 2048 if not is_classification else 1024
                 }
 
-                # Disable all safety filters for video content analysis
+                # Use BLOCK_ONLY_HIGH for all configurable safety categories
                 safety_settings = [
                     {
                         "category": "HARM_CATEGORY_HARASSMENT",
-                        "threshold": "BLOCK_NONE"
+                        "threshold": "BLOCK_ONLY_HIGH"
                     },
                     {
                         "category": "HARM_CATEGORY_HATE_SPEECH",
-                        "threshold": "BLOCK_NONE"
+                        "threshold": "BLOCK_ONLY_HIGH"
                     },
                     {
                         "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                        "threshold": "BLOCK_NONE"
+                        "threshold": "BLOCK_ONLY_HIGH"
                     },
                     {
                         "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                        "threshold": "BLOCK_NONE"
+                        "threshold": "BLOCK_ONLY_HIGH"
                     }
                 ]
 
@@ -284,13 +289,55 @@ class GeminiService:
 
                 self.last_request_time = time.time()
 
-                if response and response.text:
+                # Check for safety blocking or empty response
+                if not response:
+                    self.consecutive_failures += 1
+                    raise Exception("No response from Gemini")
+
+                # Check finish_reason first to detect safety blocks
+                if hasattr(response, 'candidates') and response.candidates:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, 'finish_reason'):
+                        finish_reason = candidate.finish_reason
+
+                        # Handle different finish reasons
+                        if finish_reason == 2:  # SAFETY
+                            self.consecutive_failures += 1
+                            safety_ratings = getattr(candidate, 'safety_ratings', [])
+                            raise Exception(f"Content blocked by safety filters (finish_reason: SAFETY). Ratings: {safety_ratings}")
+                        elif finish_reason == 3:  # RECITATION
+                            self.consecutive_failures += 1
+                            raise Exception("Content blocked due to recitation (finish_reason: RECITATION)")
+                        elif finish_reason not in [1, None]:  # Not STOP or None (normal completion)
+                            self.consecutive_failures += 1
+                            raise Exception(f"Abnormal finish_reason: {finish_reason}")
+
+                # Check if we have valid response text
+                if response.text and len(response.text.strip()) > 0:
+                    # Reset failure count on successful response
+                    self.consecutive_failures = 0
                     return response.text
                 else:
-                    raise Exception("Empty response from Gemini")
+                    self.consecutive_failures += 1
+                    # If we have candidates but no text, it might be a partial safety block
+                    if hasattr(response, 'candidates') and response.candidates:
+                        candidate = response.candidates[0]
+                        if hasattr(candidate, 'safety_ratings'):
+                            raise Exception(f"Empty response with safety concerns: {candidate.safety_ratings}")
+                    raise Exception("Empty response text from Gemini")
 
             except Exception as e:
-                logger.warning(f"Gemini API attempt {attempt + 1} failed: {str(e)}")
+                error_msg = str(e)
+
+                # Count all types of failures
+                if "finish_reason" in error_msg and "2" in error_msg:
+                    self.consecutive_failures += 1
+                elif "safety" in error_msg.lower() or "block" in error_msg.lower():
+                    self.consecutive_failures += 1
+                elif "empty" in error_msg.lower() or "no response" in error_msg.lower():
+                    self.consecutive_failures += 1
+
+                logger.warning(f"Gemini API attempt {attempt + 1} failed: {error_msg} (total failures: {self.consecutive_failures})")
 
                 if attempt == self.max_retries - 1:
                     raise e
@@ -298,6 +345,7 @@ class GeminiService:
                 # Exponential backoff
                 await asyncio.sleep(self.retry_delay * (2 ** attempt))
 
+        self.consecutive_failures += 1
         raise Exception("All Gemini API retry attempts failed")
 
     async def numpy_to_base64(self, frame: np.ndarray) -> str:
@@ -354,7 +402,9 @@ class GeminiService:
                 return [single_result] if expected_count == 1 else [single_result] * expected_count
 
         except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing error: {e}")
+            # Count JSON parsing errors as failures too
+            self.consecutive_failures += 1
+            logger.error(f"JSON parsing error: {e} (total failures: {self.consecutive_failures})")
             logger.error(f"Response text: {response_text[:500]}...")
 
         # Fallback
@@ -372,7 +422,9 @@ class GeminiService:
                 return json.loads(json_str)
 
         except json.JSONDecodeError as e:
-            logger.error(f"Classification parsing error: {e}")
+            # Count JSON parsing errors as failures too
+            self.consecutive_failures += 1
+            logger.error(f"Classification parsing error: {e} (total failures: {self.consecutive_failures})")
 
         # Fallback classification
         return {

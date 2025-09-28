@@ -2,7 +2,7 @@ import boto3
 import aiofiles
 import asyncio
 from botocore.exceptions import ClientError, NoCredentialsError
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import os
 import logging
 from typing import Optional
@@ -117,7 +117,7 @@ class S3Service:
             )
 
             # Generate public URL
-            s3_url = f"https://{bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{full_s3_key}"
+            s3_url = f"https://{bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{quote(full_s3_key)}"
 
             logger.info(f"Uploaded {local_path} to {s3_url}")
             return s3_url
@@ -181,7 +181,7 @@ class S3Service:
                 }
             )
 
-            s3_url = f"https://{bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{full_s3_key}"
+            s3_url = f"https://{bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{quote(full_s3_key)}"
             return s3_url
 
         except Exception as e:
@@ -290,7 +290,7 @@ class S3Service:
                 ACL='public-read'
             )
 
-            dest_url = f"https://{dest_bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{dest_key}"
+            dest_url = f"https://{dest_bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{quote(dest_key)}"
             return dest_url
 
         except Exception as e:
@@ -417,7 +417,7 @@ class S3Service:
                 MultipartUpload={'Parts': parts}
             )
 
-            s3_url = f"https://{bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{s3_key}"
+            s3_url = f"https://{bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{quote(s3_key)}"
             return s3_url
 
         except Exception as e:
@@ -464,7 +464,7 @@ class S3Service:
                     'key': obj['Key'],
                     'size': obj['Size'],
                     'last_modified': obj['LastModified'],
-                    'url': f"https://{bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{obj['Key']}"
+                    'url': f"https://{bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{quote(obj['Key'])}"
                 })
 
             return files

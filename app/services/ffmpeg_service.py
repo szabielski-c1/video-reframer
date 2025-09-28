@@ -188,20 +188,34 @@ class FFmpegService:
             for i, segment in enumerate(segments):
                 segment_file = os.path.join(temp_dir, f"segment_{i:03d}.mp4")
 
-                if segment['type'] == 'static':
-                    # Static crop for this segment
-                    await self.create_static_segment(
-                        input_path, segment, segment_file, out_w, out_h, quality
-                    )
-                else:
-                    # Smooth pan segment
-                    await self.create_smooth_segment(
-                        input_path, segment, segment_file, out_w, out_h, quality
-                    )
+                try:
+                    if segment['type'] == 'static':
+                        # Static crop for this segment
+                        await self.create_static_segment(
+                            input_path, segment, segment_file, out_w, out_h, quality
+                        )
+                    else:
+                        # Smooth pan segment
+                        await self.create_smooth_segment(
+                            input_path, segment, segment_file, out_w, out_h, quality
+                        )
 
-                segment_files.append(segment_file)
+                    # Only add to list if file was actually created
+                    if os.path.exists(segment_file) and os.path.getsize(segment_file) > 0:
+                        segment_files.append(segment_file)
+                        logger.info(f"✓ Created segment file: {os.path.basename(segment_file)} ({os.path.getsize(segment_file)} bytes)")
+                    else:
+                        logger.warning(f"⚠️ Segment file not created or empty: {segment_file}")
+
+                except Exception as e:
+                    logger.error(f"❌ Failed to create segment {i}: {e}")
+                    continue
 
             # Concatenate all segments
+            if not segment_files:
+                raise Exception("No valid video segments were created")
+
+            logger.info(f"🔗 Concatenating {len(segment_files)} valid segments")
             output_path = tempfile.mktemp(suffix='.mp4')
             await self.concatenate_segments(segment_files, output_path)
 
@@ -254,6 +268,13 @@ class FFmpegService:
         kf = segment['keyframes'][0]
         duration = segment['end_time'] - segment['start_time']
 
+        # Ensure minimum duration to avoid zero-length segments
+        if duration <= 0.01:
+            logger.warning(f"Segment duration too short ({duration}s), skipping segment from {segment['start_time']} to {segment['end_time']}")
+            return
+
+        logger.info(f"Creating static segment: {segment['start_time']:.3f}s to {segment['end_time']:.3f}s (duration: {duration:.3f}s)")
+
         # Calculate crop position
         metadata = await self.get_video_metadata(input_path)
         crop_x = int(kf.center_x * metadata['width'] - out_w / 2)
@@ -286,6 +307,15 @@ class FFmpegService:
     ):
         """Create segment with smooth interpolation"""
 
+        duration = segment['end_time'] - segment['start_time']
+
+        # Ensure minimum duration to avoid zero-length segments
+        if duration <= 0.01:
+            logger.warning(f"Segment duration too short ({duration}s), skipping segment from {segment['start_time']} to {segment['end_time']}")
+            return
+
+        logger.info(f"Creating smooth segment: {segment['start_time']:.3f}s to {segment['end_time']:.3f}s (duration: {duration:.3f}s)")
+
         # Use the smooth crop filter for this segment
         metadata = await self.get_video_metadata(input_path)
         crop_filter = self.generate_smooth_crop_filter(
@@ -293,8 +323,6 @@ class FFmpegService:
             metadata['width'], metadata['height'],
             out_w, out_h
         )
-
-        duration = segment['end_time'] - segment['start_time']
 
         cmd = [
             'ffmpeg',

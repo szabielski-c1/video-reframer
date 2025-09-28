@@ -201,11 +201,13 @@ class VideoProcessor:
             'input_duration': metadata['duration'],
             'input_resolution': f"{metadata['width']}x{metadata['height']}",
             'output_resolution': f"{int(metadata['height'] * 9/16)}x{metadata['height']}",
-            'shots_analyzed': len(shots),
+            'frames_analyzed': len(shots),  # Frontend expects 'frames_analyzed'
+            'shots_analyzed': len(shots),   # Keep this for backwards compatibility
             'total_keyframes': len(keyframes),
             'total_cuts': total_cuts,
             'average_confidence': avg_confidence,
-            'shot_statistics': shot_stats,
+            'subject_statistics': shot_stats,  # Frontend expects 'subject_statistics'
+            'shot_statistics': shot_stats,     # Keep this for backwards compatibility
             'processing_approach': 'video_upload_analysis',
             'processing_time': (datetime.utcnow() - datetime.utcnow()).total_seconds()  # Would track actual time
         }

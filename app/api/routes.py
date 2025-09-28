@@ -44,6 +44,38 @@ async def create_reframe_job(
     if not await validate_input_url(request.input_url):
         raise HTTPException(status_code=400, detail="Invalid or inaccessible input URL")
 
+    # Pre-validate Gemini AI health before starting processing
+    try:
+        gemini_health = await processor.gemini.health_check()
+
+        if gemini_health["status"] == "model_not_found":
+            raise HTTPException(
+                status_code=503,
+                detail=f"AI service unavailable: {gemini_health.get('error', 'Model not found')}"
+            )
+        elif gemini_health["status"] == "connection_failed":
+            raise HTTPException(
+                status_code=503,
+                detail="AI service connection failed. Please try again later."
+            )
+        elif gemini_health["status"] == "quota_exceeded":
+            raise HTTPException(
+                status_code=429,
+                detail="AI service quota exceeded. Please try again later."
+            )
+        elif gemini_health["status"] not in ["healthy", "degraded"]:
+            logger.warning(f"Gemini health check returned: {gemini_health}")
+            # Allow processing to continue for other statuses but log warning
+
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
+    except Exception as e:
+        logger.error(f"Gemini health check failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="AI service health check failed. Please try again later."
+        )
+
     # Initialize job in Redis
     job_data = {
         'job_id': job_id,
@@ -287,8 +319,32 @@ async def websocket_endpoint(websocket: WebSocket, job_id: str):
             pass
         await websocket.close()
 
+@router.get("/health/gemini")
+async def gemini_health_check(processor=Depends(get_video_processor)):
+    """Check Gemini AI service health"""
+
+    try:
+        health_result = await processor.gemini.health_check()
+
+        # Set HTTP status code based on health
+        status_code = 200
+        if health_result['status'] in ['connection_failed', 'model_not_found']:
+            status_code = 503  # Service Unavailable
+        elif health_result['status'] in ['degraded', 'quota_exceeded', 'safety_blocked']:
+            status_code = 200  # OK but with warnings
+
+        return health_result
+    except Exception as e:
+        return {
+            'status': 'critical_error',
+            'error': str(e),
+            'response_time_ms': 0,
+            'model': settings.GEMINI_MODEL,
+            'last_checked': None
+        }
+
 @router.get("/health")
-async def health_check():
+async def health_check(processor=Depends(get_video_processor)):
     """Health check endpoint"""
 
     health_status = {
@@ -314,6 +370,26 @@ async def health_check():
         health_status["s3"] = "connected"
     except Exception as e:
         health_status["s3"] = f"error: {str(e)}"
+        health_status["status"] = "degraded"
+
+    # Check Gemini AI health
+    try:
+        gemini_health = await processor.gemini.health_check()
+        health_status["gemini"] = {
+            "status": gemini_health["status"],
+            "model": gemini_health["model"],
+            "response_time_ms": gemini_health["response_time_ms"]
+        }
+
+        # Update overall status if Gemini is unhealthy
+        if gemini_health["status"] in ["connection_failed", "model_not_found"]:
+            health_status["status"] = "unhealthy"
+        elif gemini_health["status"] in ["degraded", "quota_exceeded", "safety_blocked"]:
+            if health_status["status"] == "healthy":
+                health_status["status"] = "degraded"
+
+    except Exception as e:
+        health_status["gemini"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
     return health_status

@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # Performance
     MAX_WORKERS: int = 4
-    FRAME_ANALYSIS_FPS: float = 2.0  # Analyze 2 frames per second
+    FRAME_ANALYSIS_FPS: float = 2.0  # Analyze 2 frames per second for music videos
     OUTPUT_VIDEO_QUALITY: str = "high"  # high, medium, fast
 
     # Railway specific

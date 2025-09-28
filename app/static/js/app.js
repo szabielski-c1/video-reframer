@@ -5,9 +5,11 @@ class VideoReframer {
         this.currentJobId = null;
         this.websocket = null;
         this.uploadedVideoUrl = null;
+        this.healthCheckInterval = null;
 
         this.initializeEventListeners();
         this.setupDragAndDrop();
+        this.startHealthMonitoring();
     }
 
     initializeEventListeners() {
@@ -358,6 +360,88 @@ class VideoReframer {
         ['progress-section', 'results-section', 'error-section'].forEach(id => {
             document.getElementById(id).classList.add('d-none');
         });
+    }
+
+    // Health monitoring methods
+    startHealthMonitoring() {
+        // Check immediately
+        this.checkGeminiHealth();
+
+        // Then check every 30 seconds
+        this.healthCheckInterval = setInterval(() => {
+            this.checkGeminiHealth();
+        }, 30000);
+    }
+
+    async checkGeminiHealth() {
+        try {
+            const response = await fetch('/api/v1/health/gemini');
+            const health = await response.json();
+
+            this.updateHealthStatus(health);
+        } catch (error) {
+            console.error('Health check failed:', error);
+            this.updateHealthStatus({
+                status: 'connection_failed',
+                error: 'Failed to check AI status',
+                response_time_ms: 0
+            });
+        }
+    }
+
+    updateHealthStatus(health) {
+        const statusElement = document.getElementById('ai-status');
+        const uploadButton = document.getElementById('process-btn');
+
+        if (!statusElement) return;
+
+        // Clear existing classes
+        statusElement.className = 'ai-status';
+
+        let statusText = '';
+        let allowUploads = true;
+
+        switch (health.status) {
+            case 'healthy':
+                statusElement.classList.add('status-healthy');
+                statusText = `AI Ready (${health.response_time_ms}ms)`;
+                break;
+
+            case 'degraded':
+                statusElement.classList.add('status-warning');
+                statusText = `AI Degraded (${health.response_time_ms}ms)`;
+                break;
+
+            case 'model_not_found':
+                statusElement.classList.add('status-error');
+                statusText = 'AI Model Not Found';
+                allowUploads = false;
+                break;
+
+            case 'connection_failed':
+                statusElement.classList.add('status-error');
+                statusText = 'AI Connection Failed';
+                allowUploads = false;
+                break;
+
+            case 'quota_exceeded':
+                statusElement.classList.add('status-warning');
+                statusText = 'AI Quota Exceeded';
+                allowUploads = false;
+                break;
+
+            default:
+                statusElement.classList.add('status-unknown');
+                statusText = `AI Status: ${health.status}`;
+        }
+
+        statusElement.textContent = statusText;
+
+        // Enable/disable upload based on AI status
+        if (uploadButton) {
+            uploadButton.disabled = !allowUploads;
+            uploadButton.title = allowUploads ? '' : 'AI service unavailable';
+        }
     }
 }
 

@@ -227,3 +227,68 @@ video {
 .bg-success {
     background: linear-gradient(45deg, #28a745, #20c997) !important;
 }
+
+/* AI Status Indicator */
+.ai-status {
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 0.9em;
+    font-weight: 500;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.3s ease;
+    border: 1px solid transparent;
+}
+
+.ai-status i {
+    font-size: 1em;
+}
+
+.ai-status.status-healthy {
+    background-color: #d4edda;
+    color: #155724;
+    border-color: #c3e6cb;
+}
+
+.ai-status.status-healthy::before {
+    content: "✓";
+    color: #28a745;
+    font-weight: bold;
+}
+
+.ai-status.status-warning {
+    background-color: #fff3cd;
+    color: #856404;
+    border-color: #ffeaa7;
+}
+
+.ai-status.status-warning::before {
+    content: "⚠";
+    color: #ffc107;
+    font-weight: bold;
+}
+
+.ai-status.status-error {
+    background-color: #f8d7da;
+    color: #721c24;
+    border-color: #f5c6cb;
+}
+
+.ai-status.status-error::before {
+    content: "✗";
+    color: #dc3545;
+    font-weight: bold;
+}
+
+.ai-status.status-unknown {
+    background-color: #e2e3e5;
+    color: #6c757d;
+    border-color: #ced4da;
+}
+
+.ai-status.status-unknown::before {
+    content: "?";
+    color: #6c757d;
+    font-weight: bold;
+}

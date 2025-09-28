@@ -23,17 +23,26 @@ class GeminiService:
 
         # Rate limiting
         self.last_request_time = 0
-        self.min_request_interval = 1.0  # Minimum seconds between requests
+        self.min_request_interval = 0.5  # Reduced from 1.0 to 0.5 seconds
 
         # Retry configuration
-        self.max_retries = 3
-        self.retry_delay = 2.0
+        self.max_retries = 2  # Reduced from 3 to 2 retries
+        self.retry_delay = 1.0  # Reduced from 2.0 to 1.0 seconds
+
+        # Fast-fail tracking
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 5
 
     async def analyze_frames(self, frames: List[np.ndarray], prompt: str) -> List[Dict]:
         """Analyze multiple frames with Gemini Vision"""
 
         if not frames:
             return []
+
+        # Fast-fail if too many consecutive failures
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            logger.warning(f"Fast-failing Gemini analysis after {self.consecutive_failures} consecutive failures")
+            return [self.create_fallback_result() for _ in frames]
 
         try:
             # Convert frames to base64
@@ -51,10 +60,16 @@ class GeminiService:
             # Parse JSON response
             results = self.parse_analysis_response(response, len(frames))
 
+            # Reset failure count on success
+            self.consecutive_failures = 0
+
             return results
 
         except Exception as e:
-            logger.error(f"Gemini frame analysis error: {str(e)}")
+            # Track consecutive failures
+            self.consecutive_failures += 1
+            logger.error(f"Gemini frame analysis error: {str(e)} (failure #{self.consecutive_failures})")
+
             # Return fallback results
             return [self.create_fallback_result() for _ in frames]
 
@@ -240,10 +255,31 @@ class GeminiService:
                     'max_output_tokens': 2048 if not is_classification else 1024
                 }
 
+                # Disable all safety filters for video content analysis
+                safety_settings = [
+                    {
+                        "category": "HARM_CATEGORY_HARASSMENT",
+                        "threshold": "BLOCK_NONE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_HATE_SPEECH",
+                        "threshold": "BLOCK_NONE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        "threshold": "BLOCK_NONE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                        "threshold": "BLOCK_NONE"
+                    }
+                ]
+
                 response = await asyncio.to_thread(
                     self.vision_model.generate_content,
                     parts,
-                    generation_config=generation_config
+                    generation_config=generation_config,
+                    safety_settings=safety_settings
                 )
 
                 self.last_request_time = time.time()
@@ -390,6 +426,72 @@ class GeminiService:
             'tracking_difficulty': 0.5,
             'confidence': 0.1
         }
+
+    async def health_check(self) -> Dict:
+        """Test Gemini API connectivity and functionality"""
+
+        import time
+        start_time = time.time()
+
+        try:
+            # Create a simple test image (1x1 white pixel)
+            test_image = np.ones((100, 100, 3), dtype=np.uint8) * 255
+
+            # Simple test prompt
+            test_prompt = "Describe this image in one word. Respond with only: {\"result\": \"word\"}"
+
+            # Convert to base64
+            img_base64 = await self.numpy_to_base64(test_image)
+
+            # Test API call
+            frame_data = [{'data': img_base64}]
+            response = await self.call_gemini_with_retry(frame_data, test_prompt, is_classification=True)
+
+            response_time = time.time() - start_time
+
+            # Try to parse response
+            try:
+                json_start = response.find('{')
+                json_end = response.rfind('}') + 1
+                if json_start >= 0 and json_end > json_start:
+                    json.loads(response[json_start:json_end])
+                    json_valid = True
+                else:
+                    json_valid = False
+            except:
+                json_valid = False
+
+            return {
+                'status': 'healthy' if json_valid else 'degraded',
+                'response_time_ms': round(response_time * 1000, 2),
+                'model': settings.GEMINI_MODEL,
+                'json_parsing': 'working' if json_valid else 'issues_detected',
+                'safety_filters': 'disabled',
+                'last_checked': time.time()
+            }
+
+        except Exception as e:
+            response_time = time.time() - start_time
+            error_str = str(e)
+
+            # Categorize the error
+            if "not found" in error_str:
+                status = 'model_not_found'
+            elif "quota" in error_str.lower() or "limit" in error_str.lower():
+                status = 'quota_exceeded'
+            elif "finish_reason" in error_str:
+                status = 'safety_blocked'
+            else:
+                status = 'connection_failed'
+
+            return {
+                'status': status,
+                'error': error_str,
+                'response_time_ms': round(response_time * 1000, 2),
+                'model': settings.GEMINI_MODEL,
+                'safety_filters': 'disabled',
+                'last_checked': time.time()
+            }
 
     def create_fallback_result(self) -> Dict:
         """Create fallback analysis result when Gemini fails"""

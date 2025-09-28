@@ -55,6 +55,12 @@ class VideoProcessor:
             await self.update_job_status(job_id, JobStatus.ANALYZING, 20.0, "Analyzing scenes with AI")
             frame_analyses = await self.analyze_frames(frames, request, metadata)
 
+            # Check if AI analysis was successful
+            ai_confidence = sum(a.confidence for a in frame_analyses) / len(frame_analyses) if frame_analyses else 0
+
+            if ai_confidence < 0.2:  # Very low confidence indicates AI failure
+                raise Exception(f"AI analysis failed with confidence {ai_confidence:.2f}. Gemini service may be unavailable or blocked by safety filters.")
+
             # Track subjects across frames
             frame_analyses = self.subject_tracker.track_subjects(frame_analyses)
 
@@ -86,8 +92,9 @@ class VideoProcessor:
                 await self.send_webhook(request.webhook_url, job_id, output_url)
 
         except Exception as e:
-            logger.error(f"Error processing job {job_id}: {str(e)}")
-            await self.fail_job(job_id, str(e))
+            error_message = self.categorize_error(e)
+            logger.error(f"Error processing job {job_id}: {error_message}")
+            await self.fail_job(job_id, error_message)
             raise
 
         finally:
@@ -118,7 +125,7 @@ class VideoProcessor:
             logger.warning(f"Video aspect ratio is not 16:9, got {metadata['width']}x{metadata['height']}")
 
     async def extract_analysis_frames(self, video_path: str, metadata: Dict) -> List[np.ndarray]:
-        """Extract frames for Gemini analysis"""
+        """Extract frames for Gemini analysis at consistent 2 FPS for music videos"""
         frame_paths = await self.ffmpeg.extract_frames(
             video_path,
             fps=settings.FRAME_ANALYSIS_FPS,
@@ -267,3 +274,47 @@ class VideoProcessor:
                         os.rmdir(parent)
                 except Exception as e:
                     logger.warning(f"Failed to clean up {path}: {e}")
+
+    def categorize_error(self, error: Exception) -> str:
+        """Categorize errors into user-friendly messages"""
+
+        error_str = str(error).lower()
+
+        # Gemini AI specific errors
+        if "finish_reason" in error_str and "2" in error_str:
+            return "AI safety filters blocked this video content. Try a different video or contact support."
+        elif "quota" in error_str or "limit" in error_str:
+            return "AI service quota exceeded. Please try again later or contact support."
+        elif "not found" in error_str and "model" in error_str:
+            return "AI model configuration error. Please contact support."
+        elif "json" in error_str and ("parsing" in error_str or "decode" in error_str):
+            return "AI response format error. This may be due to content filtering. Try a different video."
+
+        # Video/FFmpeg errors
+        elif "invalid" in error_str and ("format" in error_str or "codec" in error_str):
+            return "Unsupported video format. Please use MP4, AVI, or MOV files."
+        elif "permission" in error_str or "access" in error_str:
+            return "File access error. Please try uploading the video again."
+        elif "disk" in error_str or "space" in error_str:
+            return "Insufficient storage space. Please try again later."
+
+        # Network/S3 errors
+        elif "connection" in error_str or "network" in error_str:
+            return "Network connection error. Please check your internet and try again."
+        elif "timeout" in error_str:
+            return "Request timeout. Your video may be too large. Try a shorter video."
+        elif "s3" in error_str or "bucket" in error_str:
+            return "Storage service error. Please try again later or contact support."
+
+        # Validation errors
+        elif "duration" in error_str and "exceeds" in error_str:
+            return f"Video too long. Maximum duration is {settings.MAX_VIDEO_DURATION} seconds."
+        elif "size" in error_str and "exceeds" in error_str:
+            return f"Video file too large. Maximum size is {settings.MAX_VIDEO_SIZE / 1024 / 1024:.0f}MB."
+        elif "aspect ratio" in error_str:
+            return "Video must have 16:9 aspect ratio for optimal results."
+
+        # Generic fallback
+        else:
+            return f"Processing error: {str(error)[:100]}... Please try again or contact support."
+

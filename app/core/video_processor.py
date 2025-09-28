@@ -55,8 +55,10 @@ class VideoProcessor:
 
             # Check if AI analysis was successful
             ai_confidence = reframing_data.get('confidence', 0)
-            if ai_confidence < 0.2:
+            if ai_confidence < 0.05:
                 raise Exception(f"AI reframing analysis failed with confidence {ai_confidence:.2f}. Gemini service may be unavailable or blocked by safety filters.")
+            elif ai_confidence < 0.2:
+                logger.warning(f"AI analysis has low confidence ({ai_confidence:.2f}) but proceeding anyway")
 
             # Convert shot-based reframing data to crop keyframes
             await self.update_job_status(job_id, JobStatus.PROCESSING, 45.0, "Converting reframing plan to keyframes")

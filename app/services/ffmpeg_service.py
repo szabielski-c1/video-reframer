@@ -107,7 +107,7 @@ class FFmpegService:
         in_w: int, in_h: int,
         out_w: int, out_h: int
     ) -> str:
-        """Generate smooth crop filter using zoompan for interpolation"""
+        """Generate smooth crop filter using simple crop for now (zoompan was causing syntax errors)"""
 
         if not keyframes:
             # Default center crop
@@ -115,20 +115,20 @@ class FFmpegService:
             y = (in_h - out_h) // 2
             return f"crop={out_w}:{out_h}:{x}:{y}"
 
-        # Use zoompan filter for smooth interpolation
-        duration = keyframes[-1].timestamp if keyframes else 30
+        # For now, use the first keyframe's position for a static crop
+        # TODO: Implement smooth interpolation later once basic processing works
+        first_kf = keyframes[0]
 
-        # Build zoompan expression
-        zoom_expr = "1"  # No zoom, just pan
-        x_expr = self.build_position_expression([kf.center_x for kf in keyframes], [kf.timestamp for kf in keyframes], in_w, out_w)
-        y_expr = self.build_position_expression([kf.center_y for kf in keyframes], [kf.timestamp for kf in keyframes], in_h, out_h)
+        # Convert normalized position to pixel position
+        crop_x = int(first_kf.center_x * in_w - out_w / 2)
+        crop_y = int(first_kf.center_y * in_h - out_h / 2)
 
-        filter_str = (
-            f"zoompan=z={zoom_expr}:x={x_expr}:y={y_expr}:"
-            f"d=1:s={out_w}x{out_h}:fps=30"
-        )
+        # Clamp to valid range
+        crop_x = max(0, min(crop_x, in_w - out_w))
+        crop_y = max(0, min(crop_y, in_h - out_h))
 
-        return filter_str
+        logger.info(f"Using static crop at ({crop_x}, {crop_y}) for {out_w}x{out_h} output")
+        return f"crop={out_w}:{out_h}:{crop_x}:{crop_y}"
 
     def build_position_expression(self, positions: List[float], timestamps: List[float], input_size: int, output_size: int) -> str:
         """Build FFmpeg expression for position interpolation"""

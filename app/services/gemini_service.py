@@ -42,23 +42,31 @@ class GeminiService:
         video_file = None
         try:
             # Upload video to Gemini
-            logger.info(f"Uploading video to Gemini: {os.path.basename(video_path)}")
+            logger.info(f"🎬 Step 1: Uploading video to Gemini: {os.path.basename(video_path)}")
             video_file = await self.upload_video_to_gemini(video_path)
+            logger.info(f"✓ Step 1 completed: Video uploaded successfully")
 
             # Create comprehensive reframing analysis prompt
+            logger.info(f"📝 Step 2: Creating reframing analysis prompt")
             prompt = self.create_reframing_analysis_prompt(request_settings, metadata)
+            logger.info(f"✓ Step 2 completed: Prompt created ({len(prompt)} chars)")
 
             # Analyze video with Gemini
+            logger.info(f"🤖 Step 3: Calling Gemini API for video analysis")
             response = await self.call_gemini_with_video(video_file, prompt)
+            logger.info(f"✓ Step 3 completed: Gemini analysis returned ({len(response)} chars)")
+            logger.info(f"📋 Gemini response preview: {response[:200]}...")
 
             # Parse response into shot-based reframing data
+            logger.info(f"🔍 Step 4: Parsing Gemini response into reframing data")
             reframing_data = self.parse_reframing_response(response, metadata)
+            logger.info(f"✓ Step 4 completed: Parsed {len(reframing_data.get('shots', []))} shots with confidence {reframing_data.get('confidence', 0)}")
 
-            logger.info(f"Successfully analyzed video with {len(reframing_data.get('shots', []))} shots")
             return reframing_data
 
         except Exception as e:
-            logger.error(f"Video reframing analysis failed: {str(e)}")
+            logger.error(f"❌ Video reframing analysis failed at step: {str(e)}")
+            logger.error(f"🔧 Falling back to center crop strategy")
             # Return fallback with single shot covering entire video
             duration = metadata.get('duration', 60)
             return {
@@ -476,8 +484,11 @@ class GeminiService:
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error in reframing response: {e}")
             logger.error(f"Response text sample: {response_text[:1000]}...")
+            logger.error(f"Failed JSON string: {json_str[:500] if 'json_str' in locals() else 'No JSON extracted'}...")
         except Exception as e:
             logger.error(f"Error parsing reframing response: {e}")
+            logger.error(f"Response text length: {len(response_text)} chars")
+            logger.error(f"Response preview: {response_text[:500]}...")
 
         # Fallback: single shot covering entire video
         logger.warning(f"Using fallback reframing for {duration}s video")

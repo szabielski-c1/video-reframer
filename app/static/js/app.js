@@ -1,0 +1,413 @@
+// Video Reframer Web Interface JavaScript
+
+class VideoReframer {
+    constructor() {
+        this.currentJobId = null;
+        this.websocket = null;
+        this.uploadedVideoUrl = null;
+
+        this.initializeEventListeners();
+        this.setupDragAndDrop();
+    }
+
+    initializeEventListeners() {
+        // Form submission
+        document.getElementById('upload-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            this.handleUpload();
+        });
+
+        // Cancel button
+        document.getElementById('cancel-btn').addEventListener('click', () => {
+            this.cancelJob();
+        });
+
+        // File input change
+        document.getElementById('video-file').addEventListener('change', (e) => {
+            this.handleFileSelect(e.target.files[0]);
+        });
+
+        // Range inputs - update display values
+        document.getElementById('smoothing').addEventListener('input', (e) => {
+            e.target.nextElementSibling.textContent = `Smoothing: ${e.target.value}`;
+        });
+
+        document.getElementById('padding').addEventListener('input', (e) => {
+            e.target.nextElementSibling.textContent = `Padding: ${e.target.value}x`;
+        });
+    }
+
+    setupDragAndDrop() {
+        const uploadSection = document.getElementById('upload-section');
+
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            uploadSection.addEventListener(eventName, this.preventDefaults, false);
+        });
+
+        ['dragenter', 'dragover'].forEach(eventName => {
+            uploadSection.addEventListener(eventName, () => {
+                uploadSection.classList.add('dragover');
+            }, false);
+        });
+
+        ['dragleave', 'drop'].forEach(eventName => {
+            uploadSection.addEventListener(eventName, () => {
+                uploadSection.classList.remove('dragover');
+            }, false);
+        });
+
+        uploadSection.addEventListener('drop', (e) => {
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                this.handleFileSelect(files[0]);
+            }
+        }, false);
+    }
+
+    preventDefaults(e) {
+        e.preventDefault();
+        e.stopPropagation();
+    }
+
+    handleFileSelect(file) {
+        if (!file) return;
+
+        // Validate file type
+        if (!file.type.startsWith('video/')) {
+            this.showError('Please select a valid video file.');
+            return;
+        }
+
+        // Validate file size (500MB limit)
+        const maxSize = 500 * 1024 * 1024; // 500MB
+        if (file.size > maxSize) {
+            this.showError('File size exceeds 500MB limit. Please select a smaller video.');
+            return;
+        }
+
+        // Store the file for later use
+        this.selectedFile = file;
+
+        // Preview the video
+        this.previewVideo(file);
+    }
+
+    previewVideo(file) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            this.uploadedVideoUrl = e.target.result;
+
+            // Create preview element if it doesn't exist
+            let preview = document.getElementById('video-preview');
+            if (!preview) {
+                preview = document.createElement('video');
+                preview.id = 'video-preview';
+                preview.controls = true;
+                preview.style.maxWidth = '100%';
+                preview.style.maxHeight = '200px';
+                preview.style.marginTop = '15px';
+                preview.style.borderRadius = '10px';
+
+                document.querySelector('#upload-form').appendChild(preview);
+            }
+
+            preview.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+    }
+
+    async handleUpload() {
+        const fileInput = document.getElementById('video-file');
+        const file = this.selectedFile || fileInput.files[0];
+
+        if (!file) {
+            this.showError('Please select a video file to upload.');
+            return;
+        }
+
+        try {
+            this.showProgress();
+            this.updateProgress(0, 'Uploading video...');
+
+            // Create FormData for file upload
+            const formData = new FormData();
+            formData.append('video', file);
+
+            // Add processing settings
+            const settings = this.getProcessingSettings();
+            formData.append('settings', JSON.stringify(settings));
+
+            // Upload file and start processing
+            const uploadResponse = await fetch('/api/v1/upload-and-reframe', {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!uploadResponse.ok) {
+                const errorData = await uploadResponse.json();
+                throw new Error(errorData.detail || 'Upload failed');
+            }
+
+            const result = await uploadResponse.json();
+            this.currentJobId = result.job_id;
+
+            // Start WebSocket connection for real-time updates
+            this.connectWebSocket(this.currentJobId);
+
+        } catch (error) {
+            console.error('Upload error:', error);
+            this.showError(`Upload failed: ${error.message}`);
+        }
+    }
+
+    getProcessingSettings() {
+        return {
+            mode: 'auto',
+            style: document.getElementById('video-style').value,
+            smoothing: parseFloat(document.getElementById('smoothing').value),
+            padding: parseFloat(document.getElementById('padding').value),
+            quality: document.getElementById('quality').value,
+            preserve_text: document.getElementById('preserve-text').checked,
+            enable_cuts: true,
+            audio_analysis: true
+        };
+    }
+
+    getGeminiPrompts() {
+        const customFocus = document.getElementById('custom-focus').value;
+        return {
+            custom_focus: customFocus || null,
+            priority_subjects: null,
+            exclude_areas: null
+        };
+    }
+
+    connectWebSocket(jobId) {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/api/v1/ws/${jobId}`;
+
+        this.websocket = new WebSocket(wsUrl);
+
+        this.websocket.onopen = () => {
+            console.log('WebSocket connected');
+        };
+
+        this.websocket.onmessage = (event) => {
+            const update = JSON.parse(event.data);
+            this.handleProgressUpdate(update);
+        };
+
+        this.websocket.onerror = (error) => {
+            console.error('WebSocket error:', error);
+            this.showError('Lost connection to server. Refreshing...');
+            setTimeout(() => location.reload(), 3000);
+        };
+
+        this.websocket.onclose = () => {
+            console.log('WebSocket disconnected');
+        };
+    }
+
+    handleProgressUpdate(update) {
+        if (update.error) {
+            this.showError(update.error);
+            return;
+        }
+
+        this.updateProgress(update.progress, update.message);
+
+        if (update.status === 'completed') {
+            this.showResults(update.output_url, update.preview_url, update.analytics);
+        } else if (update.status === 'failed') {
+            this.showError(update.error || 'Processing failed');
+        }
+    }
+
+    updateProgress(percentage, message) {
+        document.getElementById('progress-percentage').textContent = `${Math.round(percentage)}%`;
+        document.getElementById('progress-message').textContent = message;
+        document.getElementById('progress-bar').style.width = `${percentage}%`;
+        document.getElementById('job-id').textContent = this.currentJobId || '';
+    }
+
+    showProgress() {
+        this.hideAllSections();
+        document.getElementById('progress-section').classList.remove('d-none');
+        document.getElementById('process-btn').disabled = true;
+    }
+
+    showResults(outputUrl, previewUrl, analytics) {
+        this.hideAllSections();
+        document.getElementById('results-section').classList.remove('d-none');
+
+        // Set up videos
+        if (this.uploadedVideoUrl) {
+            document.getElementById('original-video').src = this.uploadedVideoUrl;
+        }
+
+        const reframedVideo = document.getElementById('reframed-video');
+        reframedVideo.src = outputUrl;
+
+        // Set up download link
+        const downloadLink = document.getElementById('download-link');
+        downloadLink.href = outputUrl;
+        downloadLink.download = `reframed-${Date.now()}.mp4`;
+
+        // Display analytics
+        if (analytics) {
+            this.displayAnalytics(analytics);
+        }
+
+        // Close WebSocket
+        if (this.websocket) {
+            this.websocket.close();
+        }
+    }
+
+    displayAnalytics(analytics) {
+        const analyticsContent = document.getElementById('analytics-content');
+
+        const analyticsHtml = `
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="analytics-stat">
+                        <strong>Input Duration:</strong> ${analytics.input_duration?.toFixed(1) || 'N/A'}s
+                    </div>
+                    <div class="analytics-stat">
+                        <strong>Resolution Change:</strong><br>
+                        ${analytics.input_resolution} → ${analytics.output_resolution}
+                    </div>
+                    <div class="analytics-stat">
+                        <strong>Frames Analyzed:</strong> ${analytics.frames_analyzed || 'N/A'}
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="analytics-stat">
+                        <strong>Camera Movements:</strong> ${analytics.total_keyframes || 'N/A'}
+                    </div>
+                    <div class="analytics-stat">
+                        <strong>Cut Transitions:</strong> ${analytics.total_cuts || 'N/A'}
+                    </div>
+                    <div class="analytics-stat">
+                        <strong>AI Confidence:</strong> ${(analytics.average_confidence * 100)?.toFixed(1) || 'N/A'}%
+                    </div>
+                </div>
+            </div>
+            ${this.generateSubjectStats(analytics.subject_statistics)}
+        `;
+
+        analyticsContent.innerHTML = analyticsHtml;
+    }
+
+    generateSubjectStats(subjectStats) {
+        if (!subjectStats || Object.keys(subjectStats).length === 0) {
+            return '<p class="text-muted">No subject statistics available.</p>';
+        }
+
+        let html = '<h6 class="mt-3 mb-2">Subject Statistics:</h6>';
+
+        Object.entries(subjectStats).forEach(([subjectId, stats]) => {
+            const speakingPercentage = (stats.speaking_ratio * 100).toFixed(1);
+            html += `
+                <div class="analytics-stat">
+                    <strong>${stats.description || subjectId}:</strong><br>
+                    <small>
+                        Screen time: ${stats.screen_time?.toFixed(1)}s |
+                        Speaking: ${speakingPercentage}% |
+                        Importance: ${(stats.average_importance * 100)?.toFixed(1)}%
+                    </small>
+                </div>
+            `;
+        });
+
+        return html;
+    }
+
+    async cancelJob() {
+        if (!this.currentJobId) return;
+
+        try {
+            const response = await fetch(`/api/v1/jobs/${this.currentJobId}`, {
+                method: 'DELETE'
+            });
+
+            if (response.ok) {
+                this.showError('Job cancelled by user.');
+            }
+        } catch (error) {
+            console.error('Cancel error:', error);
+        }
+
+        if (this.websocket) {
+            this.websocket.close();
+        }
+    }
+
+    showError(message) {
+        this.hideAllSections();
+        document.getElementById('error-section').classList.remove('d-none');
+        document.getElementById('error-message').textContent = message;
+        document.getElementById('process-btn').disabled = false;
+
+        if (this.websocket) {
+            this.websocket.close();
+        }
+    }
+
+    hideAllSections() {
+        ['progress-section', 'results-section', 'error-section'].forEach(id => {
+            document.getElementById(id).classList.add('d-none');
+        });
+    }
+}
+
+// Initialize the application when DOM is loaded
+document.addEventListener('DOMContentLoaded', () => {
+    window.videoReframer = new VideoReframer();
+});
+
+// Utility functions for better UX
+document.addEventListener('DOMContentLoaded', () => {
+    // Add tooltips to range inputs
+    const smoothingRange = document.getElementById('smoothing');
+    const paddingRange = document.getElementById('padding');
+
+    smoothingRange.addEventListener('input', () => {
+        const value = smoothingRange.value;
+        let description = 'Medium smoothing';
+        if (value < 0.3) description = 'Minimal smoothing - more responsive';
+        else if (value > 0.7) description = 'High smoothing - very stable';
+
+        smoothingRange.nextElementSibling.textContent = `${description} (${value})`;
+    });
+
+    paddingRange.addEventListener('input', () => {
+        const value = paddingRange.value;
+        let description = 'Standard padding';
+        if (value < 1.2) description = 'Tight framing';
+        else if (value > 1.5) description = 'Loose framing';
+
+        paddingRange.nextElementSibling.textContent = `${description} (${value}x)`;
+    });
+
+    // Trigger initial updates
+    smoothingRange.dispatchEvent(new Event('input'));
+    paddingRange.dispatchEvent(new Event('input'));
+
+    // Add form validation feedback
+    const form = document.getElementById('upload-form');
+    form.addEventListener('submit', (e) => {
+        const fileInput = document.getElementById('video-file');
+        const videoReframer = window.videoReframer;
+
+        if (!fileInput.files[0] && !videoReframer?.selectedFile) {
+            e.preventDefault();
+            fileInput.classList.add('is-invalid');
+
+            // Remove invalid class after file selection
+            fileInput.addEventListener('change', () => {
+                fileInput.classList.remove('is-invalid');
+            }, { once: true });
+        }
+    });
+});

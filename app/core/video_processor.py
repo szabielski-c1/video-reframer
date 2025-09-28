@@ -60,6 +60,12 @@ class VideoProcessor:
             elif ai_confidence < 0.2:
                 logger.warning(f"AI analysis has low confidence ({ai_confidence:.2f}) but proceeding anyway")
 
+            # Align shots to frame boundaries for perfect timing
+            await self.update_job_status(job_id, JobStatus.PROCESSING, 40.0, "Aligning shots to frame boundaries")
+            fps = metadata.get('fps', 24.0)
+            frame_count = metadata.get('frame_count', 0)
+            reframing_data['shots'] = self.align_shots_to_frames(reframing_data['shots'], fps, frame_count, metadata['duration'])
+
             # Convert shot-based reframing data to crop keyframes
             await self.update_job_status(job_id, JobStatus.PROCESSING, 45.0, "Converting reframing plan to keyframes")
             crop_keyframes = self.convert_shots_to_keyframes(reframing_data['shots'], metadata)
@@ -179,6 +185,150 @@ class VideoProcessor:
 
         logger.info(f"Generated {len(crop_keyframes)} crop keyframes from {len(shots)} shots")
         return crop_keyframes
+
+    def align_to_frame_boundary(self, timestamp: float, fps: float) -> float:
+        """Align timestamp to nearest frame boundary"""
+        frame_number = round(timestamp * fps)
+        return frame_number / fps
+
+    def align_shots_to_frames(self, shots: List[Dict], fps: float, frame_count: int, total_duration: float) -> List[Dict]:
+        """
+        Align all shot boundaries to frame boundaries ensuring:
+        1. Frame-perfect alignment (no flash frames)
+        2. No missing frames (every frame is accounted for)
+        3. Total duration matches exactly
+        """
+        if not shots:
+            logger.warning("No shots to align")
+            return shots
+
+        logger.info(f"🎯 Aligning {len(shots)} shots to frame boundaries (fps={fps:.2f}, frames={frame_count}, duration={total_duration:.3f}s)")
+
+        # Create aligned shots list
+        aligned_shots = []
+
+        for i, shot in enumerate(shots):
+            aligned_shot = shot.copy()
+
+            # Align shot boundaries to frame boundaries
+            original_start = shot['start_time']
+            original_end = shot['end_time']
+
+            aligned_start = self.align_to_frame_boundary(original_start, fps)
+            aligned_end = self.align_to_frame_boundary(original_end, fps)
+
+            aligned_shot['start_time'] = aligned_start
+            aligned_shot['end_time'] = aligned_end
+            aligned_shot['duration'] = aligned_end - aligned_start
+
+            # Align keyframe timestamps within the shot
+            if 'keyframes' in shot:
+                for keyframe in aligned_shot['keyframes']:
+                    original_kf_time = keyframe.get('timestamp', aligned_start)
+                    keyframe['timestamp'] = self.align_to_frame_boundary(original_kf_time, fps)
+
+                    # Ensure keyframe timestamps are within shot boundaries
+                    keyframe['timestamp'] = max(aligned_start, min(aligned_end, keyframe['timestamp']))
+
+            logger.debug(f"Shot {i+1}: {original_start:.3f}s-{original_end:.3f}s → {aligned_start:.3f}s-{aligned_end:.3f}s (frames {int(aligned_start*fps)}-{int(aligned_end*fps)})")
+            aligned_shots.append(aligned_shot)
+
+        # Ensure complete coverage with no gaps or overlaps
+        aligned_shots = self.ensure_complete_frame_coverage(aligned_shots, fps, frame_count, total_duration)
+
+        # Validate frame coverage
+        self.validate_frame_coverage(aligned_shots, fps, frame_count, total_duration)
+
+        return aligned_shots
+
+    def ensure_complete_frame_coverage(self, shots: List[Dict], fps: float, frame_count: int, total_duration: float) -> List[Dict]:
+        """
+        Ensure shots cover every frame with no gaps or overlaps
+        """
+        if not shots:
+            return shots
+
+        # Sort shots by start time
+        shots.sort(key=lambda x: x['start_time'])
+
+        # Ensure first shot starts at frame 0
+        if shots[0]['start_time'] > 0:
+            logger.info(f"📐 Extending first shot to start at frame 0 (was {shots[0]['start_time']:.3f}s)")
+            shots[0]['start_time'] = 0.0
+            shots[0]['duration'] = shots[0]['end_time'] - shots[0]['start_time']
+
+        # Fix gaps and overlaps between shots
+        for i in range(len(shots) - 1):
+            current_shot = shots[i]
+            next_shot = shots[i + 1]
+
+            current_end_frame = round(current_shot['end_time'] * fps)
+            next_start_frame = round(next_shot['start_time'] * fps)
+
+            if current_end_frame < next_start_frame:
+                # Gap detected - extend current shot to meet next shot
+                gap_frames = next_start_frame - current_end_frame
+                logger.info(f"📐 Closing {gap_frames} frame gap between shots {i+1} and {i+2}")
+                current_shot['end_time'] = next_shot['start_time']
+                current_shot['duration'] = current_shot['end_time'] - current_shot['start_time']
+
+            elif current_end_frame > next_start_frame:
+                # Overlap detected - trim current shot to meet next shot
+                overlap_frames = current_end_frame - next_start_frame
+                logger.info(f"📐 Removing {overlap_frames} frame overlap between shots {i+1} and {i+2}")
+                current_shot['end_time'] = next_shot['start_time']
+                current_shot['duration'] = current_shot['end_time'] - current_shot['start_time']
+
+        # Ensure last shot ends exactly at the video duration
+        last_shot = shots[-1]
+        expected_end_time = frame_count / fps  # Frame-perfect end time
+
+        if abs(last_shot['end_time'] - expected_end_time) > 1/fps:
+            logger.info(f"📐 Adjusting last shot end time: {last_shot['end_time']:.3f}s → {expected_end_time:.3f}s")
+            last_shot['end_time'] = expected_end_time
+            last_shot['duration'] = last_shot['end_time'] - last_shot['start_time']
+
+        return shots
+
+    def validate_frame_coverage(self, shots: List[Dict], fps: float, frame_count: int, total_duration: float):
+        """
+        Validate that shots provide complete frame coverage
+        """
+        if not shots:
+            raise Exception("No shots to validate")
+
+        # Safety check for zero frame count
+        if frame_count <= 0:
+            logger.warning(f"⚠️ Invalid frame count ({frame_count}), skipping frame validation")
+            return
+
+        # Check total coverage
+        total_shot_duration = sum(shot['duration'] for shot in shots)
+        expected_duration = frame_count / fps
+
+        if abs(total_shot_duration - expected_duration) > 1/fps:
+            raise Exception(f"Shot duration mismatch: {total_shot_duration:.3f}s vs expected {expected_duration:.3f}s")
+
+        # Check for gaps
+        shots.sort(key=lambda x: x['start_time'])
+        for i in range(len(shots) - 1):
+            current_end = shots[i]['end_time']
+            next_start = shots[i + 1]['start_time']
+
+            if abs(current_end - next_start) > 1/(fps*2):  # Allow for sub-frame rounding
+                raise Exception(f"Gap detected between shots {i+1} and {i+2}: {current_end:.3f}s to {next_start:.3f}s")
+
+        # Check boundaries
+        if shots[0]['start_time'] != 0.0:
+            raise Exception(f"First shot doesn't start at 0.0s: {shots[0]['start_time']:.3f}s")
+
+        expected_end = frame_count / fps
+        if abs(shots[-1]['end_time'] - expected_end) > 1/(fps*2):
+            raise Exception(f"Last shot doesn't end at expected time: {shots[-1]['end_time']:.3f}s vs {expected_end:.3f}s")
+
+        # Log validation success
+        covered_frames = sum(round(shot['duration'] * fps) for shot in shots)
+        logger.info(f"✅ Frame coverage validated: {len(shots)} shots covering {covered_frames}/{frame_count} frames ({covered_frames/frame_count*100:.1f}%)")
 
     def generate_analytics_from_shots(self, shots: List[Dict], keyframes: List[CropKeyframe], metadata: Dict) -> Dict:
         """Generate processing analytics from shot-based analysis"""

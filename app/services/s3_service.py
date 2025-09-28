@@ -2,7 +2,7 @@ import boto3
 import aiofiles
 import asyncio
 from botocore.exceptions import ClientError, NoCredentialsError
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, unquote
 import os
 import logging
 from typing import Optional
@@ -304,7 +304,7 @@ class S3Service:
             # s3://bucket/key format
             parsed = urlparse(s3_url)
             bucket = parsed.netloc
-            key = parsed.path.lstrip('/')
+            key = unquote(parsed.path.lstrip('/'))
         elif 's3.amazonaws.com' in s3_url or '.s3.' in s3_url:
             # https://bucket.s3.region.amazonaws.com/key format
             parsed = urlparse(s3_url)
@@ -314,10 +314,10 @@ class S3Service:
                 # Old format: https://s3.amazonaws.com/bucket/key
                 path_parts = parsed.path.lstrip('/').split('/', 1)
                 bucket = path_parts[0]
-                key = path_parts[1] if len(path_parts) > 1 else ''
+                key = unquote(path_parts[1] if len(path_parts) > 1 else '')
                 return bucket, key
 
-            key = parsed.path.lstrip('/')
+            key = unquote(parsed.path.lstrip('/'))
         else:
             raise ValueError(f"Invalid S3 URL format: {s3_url}")
 

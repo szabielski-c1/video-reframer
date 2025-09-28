@@ -43,7 +43,30 @@ async def get_video_metadata(video_path: str) -> Dict:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps if fps > 0 else 0
+
+        # Calculate duration from frame count if available, otherwise use position
+        if frame_count > 0 and fps > 0:
+            duration = frame_count / fps
+            logger.info(f"📊 Video metadata: {frame_count} frames at {fps:.2f}fps = {duration:.3f}s")
+        else:
+            logger.warning(f"⚠️ OpenCV frame count unavailable ({frame_count}), using fallback method")
+            # Fallback: get duration by seeking to end
+            cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1.0)
+            duration = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            logger.info(f"📏 Fallback duration from seeking: {duration:.3f}s")
+
+            # Calculate frame count from duration and fps
+            if fps > 0 and duration > 0:
+                frame_count = int(duration * fps)
+                logger.info(f"🔢 Calculated frame count: {duration:.3f}s × {fps:.2f}fps = {frame_count} frames")
+            else:
+                logger.error(f"❌ Cannot calculate frame count: fps={fps}, duration={duration}")
+                # Final fallback - use duration and default fps if fps is broken
+                if duration > 0:
+                    fallback_fps = fps if fps > 0 else 23.98  # Use detected fps or common default
+                    frame_count = int(duration * fallback_fps)
+                    logger.warning(f"🆘 Emergency fallback: {duration:.3f}s × {fallback_fps:.2f}fps = {frame_count} frames")
+                    fps = fallback_fps  # Update fps for metadata
 
         cap.release()
 

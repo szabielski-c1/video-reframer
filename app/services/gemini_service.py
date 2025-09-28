@@ -1,11 +1,8 @@
 import google.generativeai as genai
-import base64
 import json
 import asyncio
 from typing import List, Dict, Any, Optional
-import numpy as np
-from PIL import Image
-import io
+import os
 import logging
 import time
 
@@ -19,97 +16,171 @@ class GeminiService:
     def __init__(self):
         genai.configure(api_key=settings.GEMINI_API_KEY)
         self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
-        self.vision_model = genai.GenerativeModel(settings.GEMINI_MODEL)
 
         # Rate limiting
         self.last_request_time = 0
-        self.min_request_interval = 0.5  # Reduced from 1.0 to 0.5 seconds
+        self.min_request_interval = 1.0  # 1 second between requests
 
         # Retry configuration
-        self.max_retries = 2  # Reduced from 3 to 2 retries
-        self.retry_delay = 1.0  # Reduced from 2.0 to 1.0 seconds
+        self.max_retries = 3
+        self.retry_delay = 5.0  # 5 seconds initial delay
 
-        # Fast-fail tracking
-        self.consecutive_failures = 0
-        self.max_consecutive_failures = 5
+        # Video upload tracking
+        self.uploaded_files = []  # Track uploaded files for cleanup
 
-    async def analyze_frames(self, frames: List[np.ndarray], prompt: str) -> List[Dict]:
-        """Analyze multiple frames with Gemini Vision"""
+    async def analyze_video_for_reframing(self, video_path: str, request_settings: Dict, metadata: Dict) -> Dict:
+        """Analyze entire video and provide shot-by-shot reframing instructions"""
 
-        if not frames:
-            return []
-
-        # Fast-fail if too many consecutive failures
-        if self.consecutive_failures >= self.max_consecutive_failures:
-            logger.warning(f"Fast-failing Gemini analysis after {self.consecutive_failures} consecutive failures")
-            return [self.create_fallback_result() for _ in frames]
-
+        video_file = None
         try:
-            # Convert frames to base64
-            frame_data = []
-            for i, frame in enumerate(frames):
-                img_base64 = await self.numpy_to_base64(frame)
-                frame_data.append({
-                    'index': i,
-                    'data': img_base64
-                })
+            # Upload video to Gemini
+            logger.info(f"Uploading video to Gemini: {os.path.basename(video_path)}")
+            video_file = await self.upload_video_to_gemini(video_path)
 
-            # Build multimodal prompt
-            response = await self.call_gemini_with_retry(frame_data, prompt)
+            # Create comprehensive reframing analysis prompt
+            prompt = self.create_reframing_analysis_prompt(request_settings, metadata)
 
-            # Parse JSON response
-            results = self.parse_analysis_response(response, len(frames))
+            # Analyze video with Gemini
+            response = await self.call_gemini_with_video(video_file, prompt)
 
-            # Reset failure count on success
-            self.consecutive_failures = 0
+            # Parse response into shot-based reframing data
+            reframing_data = self.parse_reframing_response(response, metadata)
 
-            return results
+            logger.info(f"Successfully analyzed video with {len(reframing_data.get('shots', []))} shots")
+            return reframing_data
 
         except Exception as e:
-            # Track consecutive failures
-            self.consecutive_failures += 1
-            logger.error(f"Gemini frame analysis error: {str(e)} (failure #{self.consecutive_failures})")
+            logger.error(f"Video reframing analysis failed: {str(e)}")
+            # Return fallback with single shot covering entire video
+            duration = metadata.get('duration', 60)
+            return {
+                'shots': [{
+                    'start_time': 0.0,
+                    'end_time': duration,
+                    'duration': duration,
+                    'crop_center': [0.5, 0.5],  # Center crop
+                    'crop_strategy': 'static_center',
+                    'keyframes': [
+                        {'timestamp': 0.0, 'center': [0.5, 0.5], 'zoom': 1.0},
+                        {'timestamp': duration, 'center': [0.5, 0.5], 'zoom': 1.0}
+                    ],
+                    'confidence': 0.1
+                }],
+                'overall_strategy': 'center_crop_fallback',
+                'confidence': 0.1
+            }
 
-            # Return fallback results
-            return [self.create_fallback_result() for _ in frames]
+        finally:
+            # Clean up uploaded file
+            if video_file:
+                await self.cleanup_video_file(video_file)
 
-    async def classify_scene(self, frames: List[np.ndarray]) -> Dict:
-        """Classify the overall scene type from frames"""
+    async def detect_shots(self, video_path: str, metadata: Dict) -> List[Dict]:
+        """Detect shot boundaries and scene changes in the video"""
 
-        prompt = """
-        Analyze these video frames to classify the content type and scene characteristics.
-
-        Return a JSON object with:
-        {
-            "type": "interview|vlog|sports|presentation|music|documentary|auto",
-            "description": "Brief description of what's happening",
-            "key_elements": ["list", "of", "important", "visual", "elements"],
-            "subject_count": number_of_main_subjects,
-            "motion_level": "low|medium|high",
-            "recommended_strategy": "Suggested reframing approach",
-            "confidence": 0.0-1.0
-        }
-
-        Consider:
-        - Number and types of people/subjects
-        - Movement patterns and activity level
-        - Setting and environment
-        - Production style and quality
-        - Text or graphics present
-        """
-
+        video_file = None
         try:
-            # Use first 5 frames for classification
-            sample_frames = frames[:5]
-            frame_data = []
+            # Upload video to Gemini for shot detection
+            video_file = await self.upload_video_to_gemini(video_path)
 
-            for frame in sample_frames:
-                img_base64 = await self.numpy_to_base64(frame)
-                frame_data.append({'data': img_base64})
+            duration = metadata.get('duration', 0)
 
-            response = await self.call_gemini_with_retry(frame_data, prompt, is_classification=True)
+            prompt = f"""
+            Analyze this video to detect shot boundaries and scene changes with precise timestamps.
 
-            # Parse classification response
+            Video duration: {duration} seconds
+
+            Identify:
+            1. Shot boundaries (cuts, transitions, scene changes)
+            2. Camera movements (pan, zoom, tilt)
+            3. Subject changes (new people entering/leaving frame)
+            4. Content changes (different locations, activities)
+
+            Return a JSON array of shots:
+            [
+                {{
+                    "start_time": start_seconds,
+                    "end_time": end_seconds,
+                    "duration": duration_seconds,
+                    "shot_type": "static|pan|zoom|tilt|handheld|cut",
+                    "scene_description": "what's happening in this shot",
+                    "primary_subjects": ["list", "of", "main", "subjects"],
+                    "location_or_setting": "description of location/background",
+                    "movement_intensity": 0.0_to_1.0,
+                    "shot_stability": 0.0_to_1.0,
+                    "recommended_crop_strategy": "center|follow_subject|wide_view|dynamic",
+                    "confidence": 0.0_to_1.0
+                }}
+            ]
+
+            Requirements:
+            - Detect ALL shot boundaries, even quick cuts
+            - Provide precise timestamps to 0.1 second accuracy
+            - Ensure shots cover the entire video duration (0 to {duration} seconds)
+            - No gaps or overlaps between shots
+            - Minimum shot duration: 0.5 seconds
+            - Focus on visual changes that would affect reframing strategy
+            """
+
+            response = await self.call_gemini_with_video(video_file, prompt)
+            shots = self.parse_shot_detection_response(response, duration)
+
+            logger.info(f"Detected {len(shots)} shots in {duration}s video")
+            return shots
+
+        except Exception as e:
+            logger.error(f"Shot detection error: {str(e)}")
+            # Return fallback: single shot covering entire video
+            return [{
+                'start_time': 0.0,
+                'end_time': duration,
+                'duration': duration,
+                'shot_type': 'static',
+                'scene_description': 'Shot detection failed',
+                'primary_subjects': ['unknown'],
+                'location_or_setting': 'unknown',
+                'movement_intensity': 0.3,
+                'shot_stability': 0.5,
+                'recommended_crop_strategy': 'center',
+                'confidence': 0.1
+            }]
+
+        finally:
+            if video_file:
+                await self.cleanup_video_file(video_file)
+
+    async def classify_scene(self, video_path: str, request_settings: Dict) -> Dict:
+        """Classify the scene type from the video"""
+
+        video_file = None
+        try:
+            # Upload video to Gemini for classification
+            video_file = await self.upload_video_to_gemini(video_path)
+
+            prompt = """
+            Analyze this video to classify the content type and scene characteristics.
+
+            Return a JSON object with:
+            {
+                "type": "interview|vlog|sports|presentation|music|documentary|auto",
+                "description": "Brief description of what's happening",
+                "key_elements": ["list", "of", "important", "visual", "elements"],
+                "subject_count": number_of_main_subjects,
+                "motion_level": "low|medium|high",
+                "recommended_strategy": "Suggested reframing approach",
+                "confidence": 0.0-1.0
+            }
+
+            Consider:
+            - Number and types of people/subjects throughout the video
+            - Movement patterns and activity level
+            - Setting and environment
+            - Production style and quality
+            - Text or graphics present
+            - Overall video flow and pacing
+            """
+
+            response = await self.call_gemini_with_video(video_file, prompt)
             classification = self.parse_classification_response(response)
 
             logger.info(f"Scene classified as: {classification.get('type', 'unknown')}")
@@ -127,108 +198,74 @@ class GeminiService:
                 'confidence': 0.1
             }
 
-    async def detect_speakers(self, frames: List[np.ndarray], audio_peaks: Optional[List[float]] = None) -> List[str]:
-        """Detect who is speaking in frames based on visual cues"""
+        finally:
+            if video_file:
+                await self.cleanup_video_file(video_file)
 
-        prompt = """
-        Identify who appears to be speaking in these video frames.
+    async def upload_video_to_gemini(self, video_path: str) -> any:
+        """Upload video file to Gemini for analysis"""
 
-        Look for:
-        - Mouth movement and lip motion
-        - Body language indicating speech
-        - Facial expressions while talking
-        - Hand gestures accompanying speech
-        - Eye contact with camera/audience
+        max_retries = self.max_retries
+        retry_delay = self.retry_delay
 
-        Return a JSON array with subject IDs who are actively speaking:
-        ["subject_id_1", "subject_id_2"]
+        for attempt in range(max_retries):
+            try:
+                file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                logger.info(f"Uploading video ({file_size_mb:.1f}MB) to Gemini (attempt {attempt + 1})")
 
-        If no clear speakers detected, return empty array: []
-        """
+                # Upload video file
+                video_file = await asyncio.to_thread(
+                    genai.upload_file,
+                    path=video_path,
+                    display_name=os.path.basename(video_path)
+                )
 
-        if audio_peaks:
-            prompt += f"\n\nAudio activity levels: {audio_peaks}"
-            prompt += "\nUse audio levels to help identify speaking patterns."
+                # Wait for processing
+                while video_file.state.name == "PROCESSING":
+                    logger.info("⏳ Waiting for video to be processed by Gemini...")
+                    await asyncio.sleep(10)
+                    video_file = await asyncio.to_thread(genai.get_file, name=video_file.name)
 
-        try:
-            frame_data = []
-            for frame in frames:
-                img_base64 = await self.numpy_to_base64(frame)
-                frame_data.append({'data': img_base64})
+                if video_file.state.name == "FAILED":
+                    raise ValueError("Video processing failed on Gemini side")
 
-            response = await self.call_gemini_with_retry(frame_data, prompt)
+                logger.info(f"✓ Video uploaded successfully: {video_file.name}")
+                self.uploaded_files.append(video_file)
+                return video_file
 
-            # Parse speaker response
-            speakers = self.parse_speaker_response(response)
-            return speakers
+            except Exception as e:
+                error_msg = str(e)
+                logger.warning(f"Upload attempt {attempt + 1} failed: {error_msg}")
 
-        except Exception as e:
-            logger.error(f"Speaker detection error: {str(e)}")
-            return []
+                if "[Errno 49]" in error_msg and attempt < max_retries - 1:
+                    logger.info(f"Network error detected, retrying in {retry_delay}s...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
 
-    async def predict_motion(self, frames: List[np.ndarray]) -> Dict:
-        """Predict future motion from sequential frames"""
+                if attempt == max_retries - 1:
+                    raise e
 
-        prompt = """
-        Analyze the motion patterns in these sequential video frames.
-        Predict where subjects and objects will move in the next 1-2 seconds.
+                await asyncio.sleep(retry_delay)
 
-        Return JSON:
-        {
-            "motion_vectors": {
-                "subject_id": {"dx": float, "dy": float, "speed": float},
-                ...
-            },
-            "predicted_positions": {
-                "subject_id": {"x": float, "y": float, "confidence": float},
-                ...
-            },
-            "scene_dynamics": "static|slow|moderate|fast|chaotic",
-            "tracking_difficulty": 0.0-1.0,
-            "confidence": 0.0-1.0
-        }
+        raise Exception("All video upload attempts failed")
 
-        Focus on:
-        - Direction and speed of movement
-        - Predictable vs unpredictable motion
-        - Subject entry/exit patterns
-        - Camera movement vs subject movement
-        """
+    async def cleanup_video_file(self, video_file) -> None:
+        """Clean up uploaded video file from Gemini"""
 
         try:
-            frame_data = []
-            for frame in frames:
-                img_base64 = await self.numpy_to_base64(frame)
-                frame_data.append({'data': img_base64})
+            await asyncio.to_thread(genai.delete_file, name=video_file.name)
+            logger.info(f"🗑️ Deleted video file from Gemini: {video_file.name}")
 
-            response = await self.call_gemini_with_retry(frame_data, prompt)
-
-            # Parse motion prediction
-            motion_data = self.parse_motion_response(response)
-            return motion_data
+            # Remove from tracking list
+            if video_file in self.uploaded_files:
+                self.uploaded_files.remove(video_file)
 
         except Exception as e:
-            logger.error(f"Motion prediction error: {str(e)}")
-            return {
-                'motion_vectors': {},
-                'predicted_positions': {},
-                'scene_dynamics': 'moderate',
-                'tracking_difficulty': 0.5,
-                'confidence': 0.1
-            }
+            logger.warning(f"Failed to delete video file {video_file.name}: {e}")
 
-    async def call_gemini_with_retry(
-        self,
-        frame_data: List[Dict],
-        prompt: str,
-        is_classification: bool = False
-    ) -> str:
-        """Call Gemini API with retry logic and rate limiting"""
-
-        # Check fast-fail first
-        if self.consecutive_failures >= self.max_consecutive_failures:
-            self.consecutive_failures += 1  # Continue counting
-            raise Exception(f"Fast-failing after {self.consecutive_failures} consecutive Gemini failures")
+    async def call_gemini_with_video(self, video_file, prompt: str) -> str:
+        """Call Gemini API with uploaded video file"""
 
         # Rate limiting
         current_time = time.time()
@@ -238,29 +275,14 @@ class GeminiService:
 
         for attempt in range(self.max_retries):
             try:
-                # Build the request parts
-                parts = []
-
-                # Add images
-                for frame_info in frame_data:
-                    parts.append({
-                        'inline_data': {
-                            'mime_type': 'image/jpeg',
-                            'data': frame_info['data']
-                        }
-                    })
-
-                # Add text prompt
-                parts.append(prompt)
-
-                # Call Gemini with less restrictive safety settings
+                # Generation config optimized for video analysis
                 generation_config = {
-                    'temperature': 0.2 if is_classification else 0.3,
+                    'temperature': 0.3,
                     'top_p': 0.95,
-                    'max_output_tokens': 2048 if not is_classification else 1024
+                    'max_output_tokens': 8192  # Larger token limit for video analysis
                 }
 
-                # Use BLOCK_ONLY_HIGH for all configurable safety categories
+                # Use BLOCK_ONLY_HIGH for safety settings
                 safety_settings = [
                     {
                         "category": "HARM_CATEGORY_HARASSMENT",
@@ -280,64 +302,45 @@ class GeminiService:
                     }
                 ]
 
+                # Call Gemini with video and prompt
                 response = await asyncio.to_thread(
-                    self.vision_model.generate_content,
-                    parts,
+                    self.model.generate_content,
+                    [prompt, video_file],
                     generation_config=generation_config,
-                    safety_settings=safety_settings
+                    safety_settings=safety_settings,
+                    request_options={"timeout": 1800}  # 30 minute timeout for video processing
                 )
 
                 self.last_request_time = time.time()
 
-                # Check for safety blocking or empty response
+                # Check response validity
                 if not response:
-                    self.consecutive_failures += 1
                     raise Exception("No response from Gemini")
 
-                # Check finish_reason first to detect safety blocks
+                # Check finish_reason for safety blocks
                 if hasattr(response, 'candidates') and response.candidates:
                     candidate = response.candidates[0]
                     if hasattr(candidate, 'finish_reason'):
                         finish_reason = candidate.finish_reason
 
-                        # Handle different finish reasons
                         if finish_reason == 2:  # SAFETY
-                            self.consecutive_failures += 1
                             safety_ratings = getattr(candidate, 'safety_ratings', [])
                             raise Exception(f"Content blocked by safety filters (finish_reason: SAFETY). Ratings: {safety_ratings}")
                         elif finish_reason == 3:  # RECITATION
-                            self.consecutive_failures += 1
                             raise Exception("Content blocked due to recitation (finish_reason: RECITATION)")
-                        elif finish_reason not in [1, None]:  # Not STOP or None (normal completion)
-                            self.consecutive_failures += 1
+                        elif finish_reason not in [1, None]:  # Not STOP or None
                             raise Exception(f"Abnormal finish_reason: {finish_reason}")
 
-                # Check if we have valid response text
+                # Check response text
                 if response.text and len(response.text.strip()) > 0:
-                    # Reset failure count on successful response
-                    self.consecutive_failures = 0
+                    logger.info(f"✓ Gemini video analysis completed ({len(response.text)} chars)")
                     return response.text
                 else:
-                    self.consecutive_failures += 1
-                    # If we have candidates but no text, it might be a partial safety block
-                    if hasattr(response, 'candidates') and response.candidates:
-                        candidate = response.candidates[0]
-                        if hasattr(candidate, 'safety_ratings'):
-                            raise Exception(f"Empty response with safety concerns: {candidate.safety_ratings}")
                     raise Exception("Empty response text from Gemini")
 
             except Exception as e:
                 error_msg = str(e)
-
-                # Count all types of failures
-                if "finish_reason" in error_msg and "2" in error_msg:
-                    self.consecutive_failures += 1
-                elif "safety" in error_msg.lower() or "block" in error_msg.lower():
-                    self.consecutive_failures += 1
-                elif "empty" in error_msg.lower() or "no response" in error_msg.lower():
-                    self.consecutive_failures += 1
-
-                logger.warning(f"Gemini API attempt {attempt + 1} failed: {error_msg} (total failures: {self.consecutive_failures})")
+                logger.warning(f"Gemini video API attempt {attempt + 1} failed: {error_msg}")
 
                 if attempt == self.max_retries - 1:
                     raise e
@@ -345,70 +348,169 @@ class GeminiService:
                 # Exponential backoff
                 await asyncio.sleep(self.retry_delay * (2 ** attempt))
 
-        self.consecutive_failures += 1
-        raise Exception("All Gemini API retry attempts failed")
+        raise Exception("All Gemini video API retry attempts failed")
 
-    async def numpy_to_base64(self, frame: np.ndarray) -> str:
-        """Convert numpy array to base64 JPEG"""
+    def create_reframing_analysis_prompt(self, request_settings: Dict, metadata: Dict) -> str:
+        """Create prompt for shot-by-shot reframing analysis"""
 
-        # Convert numpy array to PIL Image
-        if frame.dtype != np.uint8:
-            frame = (frame * 255).astype(np.uint8)
+        duration = metadata.get('duration', 0)
+        width = metadata.get('width', 1920)
+        height = metadata.get('height', 1080)
 
-        # Handle different color channels
-        if len(frame.shape) == 3:
-            if frame.shape[2] == 3:
-                img = Image.fromarray(frame, 'RGB')
-            elif frame.shape[2] == 4:
-                img = Image.fromarray(frame, 'RGBA')
-            else:
-                raise ValueError(f"Unsupported number of channels: {frame.shape[2]}")
-        else:
-            img = Image.fromarray(frame, 'L')  # Grayscale
+        prompt = f"""
+        Analyze this video for intelligent reframing from 16:9 horizontal to 9:16 vertical format.
 
-        # Convert to JPEG bytes
-        buffer = io.BytesIO()
-        img.save(buffer, format='JPEG', quality=85, optimize=True)
-        img_bytes = buffer.getvalue()
+        Video specs:
+        - Duration: {duration} seconds
+        - Resolution: {width}x{height}
+        - Target output: 9:16 vertical video (56.25% of original width)
 
-        # Encode to base64
-        return base64.b64encode(img_bytes).decode('utf-8')
+        Provide a complete shot-by-shot reframing plan:
 
-    def parse_analysis_response(self, response_text: str, expected_count: int) -> List[Dict]:
-        """Parse Gemini analysis response into structured data"""
+        {{
+            "shots": [
+                {{
+                    "start_time": seconds,
+                    "end_time": seconds,
+                    "duration": seconds,
+                    "shot_description": "what's happening in this shot",
+                    "crop_strategy": "static_center|follow_subject|pan_left_to_right|zoom_in|zoom_out|track_speaker",
+                    "primary_subjects": ["main subjects to keep in frame"],
+                    "crop_center": [x_0_to_1, y_0_to_1],  // Center point for the 9:16 crop
+                    "keyframes": [
+                        {{
+                            "timestamp": seconds_into_shot,
+                            "center": [x_0_to_1, y_0_to_1],  // Crop center at this time
+                            "zoom": 1.0_to_2.0,             // Zoom level (1.0 = fit height, 2.0 = 2x zoom)
+                            "description": "why this position"
+                        }}
+                    ],
+                    "transition_to_next": "cut|smooth_pan",
+                    "confidence": 0.0_to_1.0
+                }}
+            ],
+            "overall_strategy": "description of reframing approach",
+            "total_shots": number,
+            "confidence": 0.0_to_1.0
+        }}
+
+        Requirements:
+        1. **Shot Boundaries**: Detect ALL shot changes, cuts, and scene transitions
+        2. **Precise Timestamps**: Provide exact start/end times for each shot
+        3. **Crop Centers**: For each shot, determine optimal center point for 9:16 crop
+        4. **Movement Tracking**: For shots with camera/subject movement, provide keyframes
+        5. **Subject Priority**: Keep faces, speakers, and important elements in frame
+        6. **Text Preservation**: Keep on-screen text and graphics visible when possible
+        7. **Transition Handling**:
+           - "cut": Keep original cut/jump (most common for music videos)
+           - "smooth_pan": Only when crop position changes dramatically within same scene
+
+        Shot Strategies:
+        - **static_center**: Fixed center crop (for stable shots)
+        - **follow_subject**: Track a moving person/object
+        - **pan_left_to_right**: Gradual horizontal movement
+        - **zoom_in/zoom_out**: Gradual zoom changes
+        - **track_speaker**: Follow whoever is speaking
+
+        Keyframes:
+        - Provide keyframes for any shot longer than 3 seconds
+        - Include start, end, and intermediate points for movement
+        - Each keyframe specifies exact crop center and zoom level
+
+        Cover the entire {duration} seconds with no gaps between shots.
+        """
+
+        return prompt
+
+    def parse_reframing_response(self, response_text: str, metadata: Dict) -> Dict:
+        """Parse Gemini reframing response into shot-based reframing plan"""
+
+        duration = metadata.get('duration', 0)
 
         try:
-            # Try to find JSON in the response
-            json_start = response_text.find('[')
-            json_end = response_text.rfind(']') + 1
-
-            if json_start >= 0 and json_end > json_start:
-                json_str = response_text[json_start:json_end]
-                results = json.loads(json_str)
-
-                # Validate results
-                if isinstance(results, list) and len(results) <= expected_count:
-                    return results
-                else:
-                    logger.warning(f"Unexpected result format: {len(results)} vs {expected_count}")
-
-            # Try single object format
+            # Extract JSON object from response
             json_start = response_text.find('{')
             json_end = response_text.rfind('}') + 1
 
             if json_start >= 0 and json_end > json_start:
                 json_str = response_text[json_start:json_end]
-                single_result = json.loads(json_str)
-                return [single_result] if expected_count == 1 else [single_result] * expected_count
+                reframing_data = json.loads(json_str)
+
+                if isinstance(reframing_data, dict) and 'shots' in reframing_data:
+                    shots = reframing_data['shots']
+
+                    if isinstance(shots, list) and len(shots) > 0:
+                        # Validate and clean up shots
+                        validated_shots = []
+                        last_end_time = 0.0
+
+                        for i, shot in enumerate(shots):
+                            if isinstance(shot, dict) and 'start_time' in shot and 'end_time' in shot:
+                                # Ensure no gaps between shots
+                                if i > 0:
+                                    shot['start_time'] = max(shot['start_time'], last_end_time)
+
+                                # Ensure shot doesn't exceed video duration
+                                shot['end_time'] = min(shot['end_time'], duration)
+
+                                # Ensure minimum duration
+                                if shot['end_time'] - shot['start_time'] >= 0.5:
+                                    shot['duration'] = shot['end_time'] - shot['start_time']
+
+                                    # Ensure required fields exist
+                                    if 'crop_center' not in shot:
+                                        shot['crop_center'] = [0.5, 0.5]
+                                    if 'keyframes' not in shot:
+                                        shot['keyframes'] = [
+                                            {'timestamp': shot['start_time'], 'center': shot['crop_center'], 'zoom': 1.0},
+                                            {'timestamp': shot['end_time'], 'center': shot['crop_center'], 'zoom': 1.0}
+                                        ]
+
+                                    validated_shots.append(shot)
+                                    last_end_time = shot['end_time']
+
+                        # Ensure we cover the full video duration
+                        if validated_shots and validated_shots[-1]['end_time'] < duration:
+                            # Extend last shot to cover remaining time
+                            validated_shots[-1]['end_time'] = duration
+                            validated_shots[-1]['duration'] = duration - validated_shots[-1]['start_time']
+                            # Update last keyframe timestamp
+                            if validated_shots[-1]['keyframes']:
+                                validated_shots[-1]['keyframes'][-1]['timestamp'] = duration
+
+                        if len(validated_shots) > 0:
+                            logger.info(f"Parsed {len(validated_shots)} shots from reframing response")
+                            return {
+                                'shots': validated_shots,
+                                'overall_strategy': reframing_data.get('overall_strategy', 'parsed_from_gemini'),
+                                'confidence': reframing_data.get('confidence', 0.8)
+                            }
 
         except json.JSONDecodeError as e:
-            # Count JSON parsing errors as failures too
-            self.consecutive_failures += 1
-            logger.error(f"JSON parsing error: {e} (total failures: {self.consecutive_failures})")
-            logger.error(f"Response text: {response_text[:500]}...")
+            logger.error(f"JSON parsing error in reframing response: {e}")
+            logger.error(f"Response text sample: {response_text[:1000]}...")
+        except Exception as e:
+            logger.error(f"Error parsing reframing response: {e}")
 
-        # Fallback
-        return [self.create_fallback_result() for _ in range(expected_count)]
+        # Fallback: single shot covering entire video
+        logger.warning(f"Using fallback reframing for {duration}s video")
+        return {
+            'shots': [{
+                'start_time': 0.0,
+                'end_time': duration,
+                'duration': duration,
+                'shot_description': 'Fallback single shot',
+                'crop_strategy': 'static_center',
+                'crop_center': [0.5, 0.5],
+                'keyframes': [
+                    {'timestamp': 0.0, 'center': [0.5, 0.5], 'zoom': 1.0},
+                    {'timestamp': duration, 'center': [0.5, 0.5], 'zoom': 1.0}
+                ],
+                'confidence': 0.1
+            }],
+            'overall_strategy': 'center_crop_fallback',
+            'confidence': 0.1
+        }
 
     def parse_classification_response(self, response_text: str) -> Dict:
         """Parse scene classification response"""
@@ -437,96 +539,178 @@ class GeminiService:
             'confidence': 0.3
         }
 
-    def parse_speaker_response(self, response_text: str) -> List[str]:
-        """Parse speaker detection response"""
+    def repair_truncated_json(self, json_str: str) -> Optional[str]:
+        """Repair truncated or malformed JSON from Gemini responses"""
 
         try:
-            # Look for JSON array
+            # Try to parse as-is first
+            json.loads(json_str)
+            return json_str
+        except json.JSONDecodeError:
+            pass
+
+        # Common fixes for truncated JSON
+        fixed = json_str.strip()
+
+        # Fix unclosed arrays
+        if fixed.startswith('[') and not fixed.endswith(']'):
+            # Count opening vs closing brackets
+            open_brackets = fixed.count('[')
+            close_brackets = fixed.count(']')
+            if open_brackets > close_brackets:
+                fixed += ']' * (open_brackets - close_brackets)
+
+        # Fix unclosed objects
+        if fixed.startswith('{') and not fixed.endswith('}'):
+            open_braces = fixed.count('{')
+            close_braces = fixed.count('}')
+            if open_braces > close_braces:
+                fixed += '}' * (open_braces - close_braces)
+
+        # Fix trailing commas
+        fixed = fixed.replace(',]', ']').replace(',}', '}')
+
+        try:
+            json.loads(fixed)
+            logger.info("Successfully repaired truncated JSON")
+            return fixed
+        except json.JSONDecodeError:
+            logger.warning("Could not repair truncated JSON")
+            return None
+
+    def parse_shot_detection_response(self, response_text: str, duration: float) -> List[Dict]:
+        """Parse shot detection response into shot boundaries"""
+
+        try:
+            # Extract JSON array from response
             json_start = response_text.find('[')
             json_end = response_text.rfind(']') + 1
 
             if json_start >= 0 and json_end > json_start:
                 json_str = response_text[json_start:json_end]
-                speakers = json.loads(json_str)
+                shots = json.loads(json_str)
 
-                if isinstance(speakers, list):
-                    return [str(s) for s in speakers]
+                if isinstance(shots, list) and len(shots) > 0:
+                    # Validate and clean shots
+                    validated_shots = []
+                    last_end_time = 0.0
+
+                    for i, shot in enumerate(shots):
+                        if isinstance(shot, dict) and 'start_time' in shot and 'end_time' in shot:
+                            # Ensure no gaps between shots
+                            if i > 0:
+                                shot['start_time'] = max(shot['start_time'], last_end_time)
+
+                            # Ensure shot doesn't exceed video duration
+                            shot['end_time'] = min(shot['end_time'], duration)
+
+                            # Ensure minimum duration
+                            if shot['end_time'] - shot['start_time'] >= 0.5:
+                                shot['duration'] = shot['end_time'] - shot['start_time']
+                                validated_shots.append(shot)
+                                last_end_time = shot['end_time']
+
+                    # Ensure we cover the full video duration
+                    if validated_shots and validated_shots[-1]['end_time'] < duration:
+                        # Extend last shot to cover remaining time
+                        validated_shots[-1]['end_time'] = duration
+                        validated_shots[-1]['duration'] = duration - validated_shots[-1]['start_time']
+
+                    if len(validated_shots) > 0:
+                        logger.info(f"Validated {len(validated_shots)} shots from Gemini response")
+                        return validated_shots
 
         except json.JSONDecodeError as e:
-            logger.error(f"Speaker parsing error: {e}")
+            logger.error(f"JSON parsing error in shot detection: {e}")
+        except Exception as e:
+            logger.error(f"Error parsing shot detection response: {e}")
 
-        return []
+        # Fallback: create reasonable shot segments
+        logger.warning(f"Using fallback shot detection for {duration}s video")
+        shot_duration = min(30.0, duration / 3)  # 30s or 1/3 of video, whichever is smaller
+        shots = []
 
-    def parse_motion_response(self, response_text: str) -> Dict:
-        """Parse motion prediction response"""
+        current_time = 0.0
+        shot_id = 1
+        while current_time < duration:
+            end_time = min(current_time + shot_duration, duration)
+            shots.append({
+                'start_time': current_time,
+                'end_time': end_time,
+                'duration': end_time - current_time,
+                'shot_type': 'static',
+                'scene_description': f'Shot {shot_id}',
+                'primary_subjects': ['unknown'],
+                'location_or_setting': 'unknown',
+                'movement_intensity': 0.3,
+                'shot_stability': 0.5,
+                'recommended_crop_strategy': 'center',
+                'confidence': 0.2
+            })
+            current_time = end_time
+            shot_id += 1
 
-        try:
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
+        return shots
 
-            if json_start >= 0 and json_end > json_start:
-                json_str = response_text[json_start:json_end]
-                return json.loads(json_str)
+    async def cleanup_all_files(self) -> None:
+        """Clean up all uploaded video files"""
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Motion parsing error: {e}")
-
-        return {
-            'motion_vectors': {},
-            'predicted_positions': {},
-            'scene_dynamics': 'moderate',
-            'tracking_difficulty': 0.5,
-            'confidence': 0.1
-        }
+        for video_file in self.uploaded_files.copy():
+            await self.cleanup_video_file(video_file)
 
     async def health_check(self) -> Dict:
         """Test Gemini API connectivity and functionality"""
 
-        import time
         start_time = time.time()
 
         try:
-            # Create a simple test image (1x1 white pixel)
-            test_image = np.ones((100, 100, 3), dtype=np.uint8) * 255
+            # Simple text-only health check
+            test_prompt = "Respond with only this JSON: {\"status\": \"ok\", \"test\": \"passed\"}"
 
-            # Simple test prompt
-            test_prompt = "Describe this image in one word. Respond with only: {\"result\": \"word\"}"
+            # Use basic model call without video
+            generation_config = {
+                'temperature': 0.1,
+                'top_p': 0.95,
+                'max_output_tokens': 128
+            }
 
-            # Convert to base64
-            img_base64 = await self.numpy_to_base64(test_image)
-
-            # Test API call
-            frame_data = [{'data': img_base64}]
-            response = await self.call_gemini_with_retry(frame_data, test_prompt, is_classification=True)
+            response = await asyncio.to_thread(
+                self.model.generate_content,
+                test_prompt,
+                generation_config=generation_config
+            )
 
             response_time = time.time() - start_time
 
-            # Try to parse response
-            try:
-                json_start = response.find('{')
-                json_end = response.rfind('}') + 1
-                if json_start >= 0 and json_end > json_start:
-                    json.loads(response[json_start:json_end])
-                    json_valid = True
-                else:
+            # Validate response
+            if response and response.text:
+                try:
+                    json_start = response.text.find('{')
+                    json_end = response.text.rfind('}') + 1
+                    if json_start >= 0 and json_end > json_start:
+                        json.loads(response.text[json_start:json_end])
+                        json_valid = True
+                    else:
+                        json_valid = False
+                except:
                     json_valid = False
-            except:
-                json_valid = False
 
-            return {
-                'status': 'healthy' if json_valid else 'degraded',
-                'response_time_ms': round(response_time * 1000, 2),
-                'model': settings.GEMINI_MODEL,
-                'json_parsing': 'working' if json_valid else 'issues_detected',
-                'safety_filters': 'disabled',
-                'last_checked': time.time()
-            }
+                return {
+                    'status': 'healthy' if json_valid else 'degraded',
+                    'response_time_ms': round(response_time * 1000, 2),
+                    'model': settings.GEMINI_MODEL,
+                    'json_parsing': 'working' if json_valid else 'issues_detected',
+                    'video_upload': 'supported',
+                    'last_checked': time.time()
+                }
+            else:
+                raise Exception("No response from Gemini")
 
         except Exception as e:
             response_time = time.time() - start_time
             error_str = str(e)
 
-            # Categorize the error
+            # Categorize error
             if "not found" in error_str:
                 status = 'model_not_found'
             elif "quota" in error_str.lower() or "limit" in error_str.lower():
@@ -541,14 +725,15 @@ class GeminiService:
                 'error': error_str,
                 'response_time_ms': round(response_time * 1000, 2),
                 'model': settings.GEMINI_MODEL,
-                'safety_filters': 'disabled',
+                'video_upload': 'unknown',
                 'last_checked': time.time()
             }
 
-    def create_fallback_result(self) -> Dict:
+    def create_fallback_result(self, timestamp: float = 0.0) -> Dict:
         """Create fallback analysis result when Gemini fails"""
 
         return {
+            'timestamp': timestamp,
             'subjects': [{
                 'id': 'fallback_subject',
                 'type': 'object',

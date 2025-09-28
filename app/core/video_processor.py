@@ -13,9 +13,10 @@ from app.config import settings
 from app.services.s3_service import S3Service
 from app.services.ffmpeg_service import FFmpegService
 from app.services.gemini_service import GeminiService
-from app.core.frame_analyzer import FrameAnalyzer
-from app.core.trajectory_planner import TrajectoryPlanner
-from app.core.subject_tracker import SubjectTracker
+# Legacy components no longer needed with video-based analysis
+# from app.core.frame_analyzer import FrameAnalyzer
+# from app.core.trajectory_planner import TrajectoryPlanner
+# from app.core.subject_tracker import SubjectTracker
 from app.utils.video_utils import extract_frames, get_video_metadata
 
 logger = logging.getLogger(__name__)
@@ -26,9 +27,10 @@ class VideoProcessor:
         self.s3 = S3Service()
         self.ffmpeg = FFmpegService()
         self.gemini = GeminiService()
-        self.analyzer = FrameAnalyzer(self.gemini)
-        self.trajectory_planner = TrajectoryPlanner()
-        self.subject_tracker = SubjectTracker()
+        # Legacy components removed - now using direct Gemini video analysis
+        # self.analyzer = FrameAnalyzer(self.gemini)
+        # self.trajectory_planner = TrajectoryPlanner()
+        # self.subject_tracker = SubjectTracker()
         self.current_job_id = None
 
     async def process_video(self, job_id: str, request: ReframeRequest):
@@ -47,26 +49,18 @@ class VideoProcessor:
             metadata = await self.ffmpeg.get_video_metadata(local_path)
             self.validate_video(metadata)
 
-            # Extract frames for analysis
-            await self.update_job_status(job_id, JobStatus.ANALYZING, 10.0, "Extracting frames for analysis")
-            frames = await self.extract_analysis_frames(local_path, metadata)
-
-            # Analyze frames with Gemini
-            await self.update_job_status(job_id, JobStatus.ANALYZING, 20.0, "Analyzing scenes with AI")
-            frame_analyses = await self.analyze_frames(frames, request, metadata)
+            # Get comprehensive reframing plan from Gemini
+            await self.update_job_status(job_id, JobStatus.ANALYZING, 15.0, "Getting reframing plan from AI")
+            reframing_data = await self.gemini.analyze_video_for_reframing(local_path, request.settings, metadata)
 
             # Check if AI analysis was successful
-            ai_confidence = sum(a.confidence for a in frame_analyses) / len(frame_analyses) if frame_analyses else 0
+            ai_confidence = reframing_data.get('confidence', 0)
+            if ai_confidence < 0.2:
+                raise Exception(f"AI reframing analysis failed with confidence {ai_confidence:.2f}. Gemini service may be unavailable or blocked by safety filters.")
 
-            if ai_confidence < 0.2:  # Very low confidence indicates AI failure
-                raise Exception(f"AI analysis failed with confidence {ai_confidence:.2f}. Gemini service may be unavailable or blocked by safety filters.")
-
-            # Track subjects across frames
-            frame_analyses = self.subject_tracker.track_subjects(frame_analyses)
-
-            # Generate smooth crop trajectory
-            await self.update_job_status(job_id, JobStatus.PROCESSING, 50.0, "Planning camera movements")
-            crop_keyframes = self.trajectory_planner.plan_trajectory(frame_analyses, request.settings, metadata)
+            # Convert shot-based reframing data to crop keyframes
+            await self.update_job_status(job_id, JobStatus.PROCESSING, 45.0, "Converting reframing plan to keyframes")
+            crop_keyframes = self.convert_shots_to_keyframes(reframing_data['shots'], metadata)
 
             # Apply reframing with FFmpeg
             await self.update_job_status(job_id, JobStatus.PROCESSING, 70.0, "Reframing video")
@@ -82,7 +76,7 @@ class VideoProcessor:
             output_url = await self.upload_result(output_path, request, job_id)
 
             # Generate analytics
-            analytics = self.generate_analytics(frame_analyses, crop_keyframes, metadata)
+            analytics = self.generate_analytics_from_shots(reframing_data['shots'], crop_keyframes, metadata)
 
             # Complete job
             await self.complete_job(job_id, output_url, preview_url, analytics)
@@ -124,56 +118,85 @@ class VideoProcessor:
         if metadata['width'] / metadata['height'] != 16/9:
             logger.warning(f"Video aspect ratio is not 16:9, got {metadata['width']}x{metadata['height']}")
 
-    async def extract_analysis_frames(self, video_path: str, metadata: Dict) -> List[np.ndarray]:
-        """Extract frames for Gemini analysis at consistent 2 FPS for music videos"""
-        frame_paths = await self.ffmpeg.extract_frames(
-            video_path,
-            fps=settings.FRAME_ANALYSIS_FPS,
-            duration=min(metadata['duration'], settings.MAX_VIDEO_DURATION)
-        )
+    def convert_shots_to_keyframes(self, shots: List[Dict], metadata: Dict) -> List[CropKeyframe]:
+        """Convert shot-based reframing data to crop keyframes for FFmpeg"""
 
-        frames = []
-        for path in frame_paths:
-            frame = await extract_frames(path)
-            frames.append(frame)
+        from app.models import CropKeyframe
 
-        return frames
+        crop_keyframes = []
 
-    async def analyze_frames(self, frames: List[np.ndarray], request: ReframeRequest, metadata: Dict) -> List[FrameAnalysis]:
-        """Analyze frames using Gemini with intelligent batching"""
+        for shot in shots:
+            keyframes = shot.get('keyframes', [])
 
-        # Determine scene type and complexity first
-        scene_info = await self.analyzer.classify_scene(frames[:10], request)
+            if not keyframes:
+                # Create default keyframes for the shot
+                crop_center = shot.get('crop_center', [0.5, 0.5])
+                keyframes = [
+                    {'timestamp': shot['start_time'], 'center': crop_center, 'zoom': 1.0},
+                    {'timestamp': shot['end_time'], 'center': crop_center, 'zoom': 1.0}
+                ]
 
-        # Build comprehensive analysis
-        analyses = []
-        batch_size = 5  # Process 5 frames at once
+            # Convert each keyframe to CropKeyframe
+            for i, kf in enumerate(keyframes):
+                timestamp = kf['timestamp']
+                center = kf['center']
+                zoom = kf.get('zoom', 1.0)
 
-        for i in range(0, len(frames), batch_size):
-            batch = frames[i:i+batch_size]
-            timestamps = [i * (1.0 / settings.FRAME_ANALYSIS_FPS) for j in range(i, min(i+batch_size, len(frames)))]
+                # Calculate crop region for 9:16 output
+                # Original is 16:9, target is 9:16 (56.25% of width)
+                crop_width = 0.5625 / zoom  # 9/16 aspect ratio
+                crop_height = 1.0 / zoom
 
-            # Analyze batch with context
-            batch_analyses = await self.analyzer.analyze_batch(
-                batch,
-                timestamps,
-                scene_info,
-                request,
-                previous_analyses=analyses[-5:] if analyses else None
-            )
+                # Ensure crop doesn't go outside bounds
+                left = max(0, min(1 - crop_width, center[0] - crop_width/2))
+                top = max(0, min(1 - crop_height, center[1] - crop_height/2))
 
-            analyses.extend(batch_analyses)
+                crop_keyframe = CropKeyframe(
+                    timestamp=timestamp,
+                    left=left,
+                    top=top,
+                    width=crop_width,
+                    height=crop_height,
+                    is_cut=(i == 0 and shot.get('transition_to_next') == 'cut')
+                )
 
-            # Update progress
-            progress = 20 + (30 * len(analyses) / len(frames))
-            await self.update_job_status(
-                self.current_job_id,
-                JobStatus.ANALYZING,
-                progress,
-                f"Analyzed {len(analyses)}/{len(frames)} frames"
-            )
+                crop_keyframes.append(crop_keyframe)
 
-        return analyses
+        # Sort by timestamp
+        crop_keyframes.sort(key=lambda x: x.timestamp)
+
+        logger.info(f"Generated {len(crop_keyframes)} crop keyframes from {len(shots)} shots")
+        return crop_keyframes
+
+    def generate_analytics_from_shots(self, shots: List[Dict], keyframes: List[CropKeyframe], metadata: Dict) -> Dict:
+        """Generate processing analytics from shot-based analysis"""
+
+        total_cuts = sum(1 for kf in keyframes if kf.is_cut)
+        avg_confidence = sum(shot.get('confidence', 0) for shot in shots) / len(shots) if shots else 0
+
+        shot_stats = {
+            'total_shots': len(shots),
+            'avg_shot_duration': sum(shot['duration'] for shot in shots) / len(shots) if shots else 0,
+            'shot_strategies': {}
+        }
+
+        # Count different crop strategies
+        for shot in shots:
+            strategy = shot.get('crop_strategy', 'unknown')
+            shot_stats['shot_strategies'][strategy] = shot_stats['shot_strategies'].get(strategy, 0) + 1
+
+        return {
+            'input_duration': metadata['duration'],
+            'input_resolution': f"{metadata['width']}x{metadata['height']}",
+            'output_resolution': f"{int(metadata['height'] * 9/16)}x{metadata['height']}",
+            'shots_analyzed': len(shots),
+            'total_keyframes': len(keyframes),
+            'total_cuts': total_cuts,
+            'average_confidence': avg_confidence,
+            'shot_statistics': shot_stats,
+            'processing_approach': 'video_upload_analysis',
+            'processing_time': (datetime.utcnow() - datetime.utcnow()).total_seconds()  # Would track actual time
+        }
 
     async def generate_preview(self, video_path: str, keyframes: List[CropKeyframe], job_id: str) -> str:
         """Generate preview video with overlay"""
@@ -196,37 +219,10 @@ class VideoProcessor:
         output_url = await self.s3.upload_file(output_path, output_key, bucket=request.output_bucket)
         return output_url
 
+    # Legacy method - kept for compatibility but replaced by generate_analytics_from_shots
     def generate_analytics(self, analyses: List[FrameAnalysis], keyframes: List[CropKeyframe], metadata: Dict) -> Dict:
-        """Generate processing analytics"""
-        total_cuts = sum(1 for kf in keyframes if kf.is_cut)
-        avg_confidence = sum(a.confidence for a in analyses) / len(analyses) if analyses else 0
-
-        subject_stats = {}
-        for analysis in analyses:
-            for subject in analysis.subjects:
-                if subject.id not in subject_stats:
-                    subject_stats[subject.id] = {
-                        'screen_time': 0,
-                        'speaking_time': 0,
-                        'primary_count': 0
-                    }
-                subject_stats[subject.id]['screen_time'] += 1
-                if subject.is_speaking:
-                    subject_stats[subject.id]['speaking_time'] += 1
-                if analysis.primary_subject == subject.id:
-                    subject_stats[subject.id]['primary_count'] += 1
-
-        return {
-            'input_duration': metadata['duration'],
-            'input_resolution': f"{metadata['width']}x{metadata['height']}",
-            'output_resolution': f"{int(metadata['height'] * 9/16)}x{metadata['height']}",
-            'frames_analyzed': len(analyses),
-            'total_keyframes': len(keyframes),
-            'total_cuts': total_cuts,
-            'average_confidence': avg_confidence,
-            'subject_statistics': subject_stats,
-            'processing_time': (datetime.utcnow() - datetime.utcnow()).total_seconds()  # Would track actual time
-        }
+        """Generate processing analytics (legacy method)"""
+        return self.generate_analytics_from_shots([], keyframes, metadata)
 
     async def complete_job(self, job_id: str, output_url: str, preview_url: Optional[str], analytics: Dict):
         """Mark job as completed"""

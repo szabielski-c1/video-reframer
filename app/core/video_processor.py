@@ -51,7 +51,19 @@ class VideoProcessor:
 
             # Get comprehensive reframing plan from Gemini
             await self.update_job_status(job_id, JobStatus.ANALYZING, 15.0, "Getting reframing plan from AI")
+
+            # Break down AI analysis into more visible steps
+            await self.update_job_status(job_id, JobStatus.ANALYZING, 16.0, "Uploading video to Gemini AI")
+            await asyncio.sleep(0.1)  # Small delay to show status update
+
+            await self.update_job_status(job_id, JobStatus.ANALYZING, 20.0, "Video uploaded, creating analysis prompt")
+            await asyncio.sleep(0.1)
+
+            await self.update_job_status(job_id, JobStatus.ANALYZING, 22.0, "Gemini AI analyzing video content...")
+
             reframing_data = await self.gemini.analyze_video_for_reframing(local_path, request.settings, metadata)
+
+            await self.update_job_status(job_id, JobStatus.ANALYZING, 35.0, "AI analysis complete, processing results")
 
             # Check if AI analysis was successful
             ai_confidence = reframing_data.get('confidence', 0)
@@ -64,29 +76,50 @@ class VideoProcessor:
             await self.update_job_status(job_id, JobStatus.PROCESSING, 40.0, "Aligning shots to frame boundaries")
             fps = metadata.get('fps', 24.0)
             frame_count = metadata.get('frame_count', 0)
+
+            # Validate fps to prevent division by zero
+            if fps <= 0:
+                logger.warning(f"Invalid fps value ({fps}), using default of 24.0")
+                fps = 24.0
+
+            await self.update_job_status(job_id, JobStatus.PROCESSING, 42.0, f"Processing {len(reframing_data['shots'])} shots at {fps:.1f} fps")
             reframing_data['shots'] = self.align_shots_to_frames(reframing_data['shots'], fps, frame_count, metadata['duration'])
 
             # Convert shot-based reframing data to crop keyframes
             await self.update_job_status(job_id, JobStatus.PROCESSING, 45.0, "Converting reframing plan to keyframes")
             crop_keyframes = self.convert_shots_to_keyframes(reframing_data['shots'], metadata)
+            await self.update_job_status(job_id, JobStatus.PROCESSING, 50.0, f"Generated {len(crop_keyframes)} keyframes for smooth transitions")
 
             # Apply reframing with FFmpeg
-            await self.update_job_status(job_id, JobStatus.PROCESSING, 70.0, "Reframing video")
+            await self.update_job_status(job_id, JobStatus.PROCESSING, 55.0, "Starting video reframing with FFmpeg")
+
+            has_cuts = any(kf.is_cut for kf in crop_keyframes)
+            if has_cuts:
+                await self.update_job_status(job_id, JobStatus.PROCESSING, 60.0, "Processing video with cuts and transitions")
+            else:
+                await self.update_job_status(job_id, JobStatus.PROCESSING, 60.0, "Applying smooth crop transitions")
+
             output_path = await self.ffmpeg.apply_reframing(local_path, crop_keyframes, request.settings, metadata)
+
+            await self.update_job_status(job_id, JobStatus.PROCESSING, 85.0, "Video reframing complete")
 
             # Generate preview if requested
             preview_url = None
             if request.preview_only:
+                await self.update_job_status(job_id, JobStatus.PROCESSING, 87.0, "Generating preview")
                 preview_url = await self.generate_preview(local_path, crop_keyframes, job_id)
 
             # Upload to S3
-            await self.update_job_status(job_id, JobStatus.UPLOADING, 90.0, "Uploading result")
+            await self.update_job_status(job_id, JobStatus.UPLOADING, 90.0, "Uploading result to S3")
             output_url = await self.upload_result(output_path, request, job_id)
+            await self.update_job_status(job_id, JobStatus.UPLOADING, 95.0, "Upload complete, finalizing")
 
             # Generate analytics
+            await self.update_job_status(job_id, JobStatus.UPLOADING, 97.0, "Generating analytics")
             analytics = self.generate_analytics_from_shots(reframing_data['shots'], crop_keyframes, metadata)
 
             # Complete job
+            await self.update_job_status(job_id, JobStatus.UPLOADING, 99.0, "Finishing up")
             await self.complete_job(job_id, output_url, preview_url, analytics)
 
             # Send webhook if provided
@@ -188,6 +221,9 @@ class VideoProcessor:
 
     def align_to_frame_boundary(self, timestamp: float, fps: float) -> float:
         """Align timestamp to nearest frame boundary"""
+        if fps <= 0:
+            logger.warning(f"Invalid fps ({fps}) in align_to_frame_boundary, returning original timestamp")
+            return timestamp
         frame_number = round(timestamp * fps)
         return frame_number / fps
 
@@ -281,7 +317,17 @@ class VideoProcessor:
 
         # Ensure last shot ends exactly at the video duration
         last_shot = shots[-1]
-        expected_end_time = frame_count / fps  # Frame-perfect end time
+
+        # Use frame count if valid, otherwise use total duration
+        if frame_count > 0 and fps > 0:
+            expected_end_time = frame_count / fps  # Frame-perfect end time
+            logger.debug(f"Using frame-perfect end time: {frame_count} frames / {fps} fps = {expected_end_time:.3f}s")
+        else:
+            expected_end_time = total_duration  # Fallback to duration when frame count unavailable
+            if frame_count <= 0:
+                logger.warning(f"⚠️ Using total duration ({total_duration:.3f}s) as frame count is invalid ({frame_count})")
+            else:
+                logger.warning(f"⚠️ Using total duration ({total_duration:.3f}s) as fps is invalid ({fps})")
 
         if abs(last_shot['end_time'] - expected_end_time) > 1/fps:
             logger.info(f"📐 Adjusting last shot end time: {last_shot['end_time']:.3f}s → {expected_end_time:.3f}s")
@@ -297,9 +343,13 @@ class VideoProcessor:
         if not shots:
             raise Exception("No shots to validate")
 
-        # Safety check for zero frame count
+        # Safety check for zero frame count or fps
         if frame_count <= 0:
             logger.warning(f"⚠️ Invalid frame count ({frame_count}), skipping frame validation")
+            return
+
+        if fps <= 0:
+            logger.warning(f"⚠️ Invalid fps ({fps}), skipping frame validation")
             return
 
         # Check total coverage

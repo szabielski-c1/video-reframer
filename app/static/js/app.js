@@ -211,6 +211,8 @@ class VideoReframer {
     }
 
     handleProgressUpdate(update) {
+        console.log('Progress update received:', update);
+
         if (update.error) {
             this.showError(update.error);
             return;
@@ -219,6 +221,13 @@ class VideoReframer {
         this.updateProgress(update.progress, update.message);
 
         if (update.status === 'completed') {
+            console.log('Processing completed, output_url:', update.output_url);
+            console.log('Analytics received:', update.analytics);
+            if (!update.output_url) {
+                console.error('No output URL received in completion message:', update);
+                this.showError('Processing completed but no video URL was provided. Please check the server logs.');
+                return;
+            }
             this.showResults(update.output_url, update.preview_url, update.analytics);
         } else if (update.status === 'failed') {
             this.showError(update.error || 'Processing failed');
@@ -239,6 +248,12 @@ class VideoReframer {
     }
 
     showResults(outputUrl, previewUrl, analytics) {
+        if (!outputUrl) {
+            console.error('showResults called without outputUrl');
+            this.showError('No output video URL available');
+            return;
+        }
+
         this.hideAllSections();
         document.getElementById('results-section').classList.remove('d-none');
 
@@ -256,8 +271,12 @@ class VideoReframer {
         downloadLink.download = `reframed-${Date.now()}.mp4`;
 
         // Display analytics
+        console.log('showResults called with analytics:', analytics);
         if (analytics) {
+            console.log('Displaying analytics...');
             this.displayAnalytics(analytics);
+        } else {
+            console.log('No analytics to display');
         }
 
         // Close WebSocket
@@ -295,10 +314,40 @@ class VideoReframer {
                     </div>
                 </div>
             </div>
-            ${this.generateSubjectStats(analytics.subject_statistics)}
+            ${this.generateShotStats(analytics.subject_statistics)}
         `;
 
         analyticsContent.innerHTML = analyticsHtml;
+    }
+
+    generateShotStats(shotStats) {
+        if (!shotStats || !shotStats.shot_strategies) {
+            return '<p class="text-muted">No shot statistics available.</p>';
+        }
+
+        let html = '<h6 class="mt-3 mb-2">Shot Breakdown:</h6>';
+
+        const strategies = shotStats.shot_strategies;
+        const totalShots = shotStats.total_shots || Object.values(strategies).reduce((a, b) => a + b, 0);
+
+        Object.entries(strategies).forEach(([strategy, count]) => {
+            const percentage = totalShots > 0 ? ((count / totalShots) * 100).toFixed(1) : '0';
+            const strategyName = strategy.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+
+            html += `
+                <div class="analytics-stat">
+                    <strong>${strategyName}:</strong> ${count} shots (${percentage}%)
+                </div>
+            `;
+        });
+
+        html += `
+            <div class="analytics-stat mt-2">
+                <strong>Total Shots:</strong> ${totalShots}
+            </div>
+        `;
+
+        return html;
     }
 
     generateSubjectStats(subjectStats) {

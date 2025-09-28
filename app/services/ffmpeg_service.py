@@ -47,25 +47,35 @@ class FFmpegService:
         output_path = tempfile.mktemp(suffix='.mp4')
         quality = self.quality_presets[settings.quality]
 
-        # Calculate output dimensions (9:16 aspect ratio)
+        # Calculate output dimensions (9:16 aspect ratio for vertical video)
         input_width = metadata['width']
         input_height = metadata['height']
-        # Calculate 9:16 aspect ratio, ensure even numbers for FFmpeg compatibility
-        output_width = int(input_height * 9 / 16)
-        output_height = input_height
 
-        # Ensure even dimensions (FFmpeg requirement)
-        if output_width % 2 != 0:
-            output_width -= 1
-        if output_height % 2 != 0:
-            output_height -= 1
+        # Target standard vertical resolution: 1080x1920 (9:16 aspect ratio)
+        target_width = 1080
+        target_height = 1920
 
-        logger.info(f"Output resolution: {output_width}x{output_height} (from {input_width}x{input_height})")
+        # First, calculate the crop dimensions to get 9:16 aspect ratio
+        # For 1920x1080 input, we want to crop to 607x1080 (9:16), then scale to 1080x1920
+        crop_width = int(input_height * 9 / 16)  # 1080 * 9/16 = 607
+        crop_height = input_height  # Use full height: 1080
 
-        # Ensure output width doesn't exceed input width
-        if output_width > input_width:
-            output_width = input_width
-            output_height = int(input_width * 16 / 9)
+        # Ensure crop dimensions don't exceed input
+        if crop_width > input_width:
+            crop_width = input_width
+            crop_height = int(input_width * 16 / 9)
+
+        # Ensure even dimensions for cropping (FFmpeg requirement)
+        if crop_width % 2 != 0:
+            crop_width -= 1
+        if crop_height % 2 != 0:
+            crop_height -= 1
+
+        # Final output will be scaled to standard vertical resolution
+        output_width = target_width
+        output_height = target_height
+
+        logger.info(f"Crop to: {crop_width}x{crop_height}, then scale to: {output_width}x{output_height} (from {input_width}x{input_height})")
 
         # Handle cuts vs smooth pans
         has_cuts = any(kf.is_cut for kf in keyframes)
@@ -73,18 +83,21 @@ class FFmpegService:
         if has_cuts:
             # Complex processing with cuts
             output_path = await self.process_with_cuts(
-                input_path, keyframes, output_width, output_height, quality
+                input_path, keyframes, crop_width, crop_height, output_width, output_height, quality
             )
         else:
             # Simple smooth crop with interpolation
             crop_filter = self.generate_smooth_crop_filter(
-                keyframes, input_width, input_height, output_width, output_height
+                keyframes, input_width, input_height, crop_width, crop_height
             )
+
+            # Add scaling after cropping to get final resolution
+            video_filter = f"{crop_filter},scale={output_width}:{output_height}"
 
             cmd = [
                 'ffmpeg',
                 '-i', input_path,
-                '-vf', crop_filter,
+                '-vf', video_filter,
                 '-c:v', 'libx264',
                 '-crf', str(quality['crf']),
                 '-preset', quality['preset'],
@@ -105,30 +118,30 @@ class FFmpegService:
         self,
         keyframes: List[CropKeyframe],
         in_w: int, in_h: int,
-        out_w: int, out_h: int
+        crop_w: int, crop_h: int
     ) -> str:
-        """Generate smooth crop filter using simple crop for now (zoompan was causing syntax errors)"""
+        """Generate smooth crop filter to crop input to 9:16 aspect ratio"""
 
         if not keyframes:
             # Default center crop
-            x = (in_w - out_w) // 2
-            y = (in_h - out_h) // 2
-            return f"crop={out_w}:{out_h}:{x}:{y}"
+            x = (in_w - crop_w) // 2
+            y = (in_h - crop_h) // 2
+            return f"crop={crop_w}:{crop_h}:{x}:{y}"
 
         # For now, use the first keyframe's position for a static crop
         # TODO: Implement smooth interpolation later once basic processing works
         first_kf = keyframes[0]
 
         # Convert normalized position to pixel position
-        crop_x = int(first_kf.center_x * in_w - out_w / 2)
-        crop_y = int(first_kf.center_y * in_h - out_h / 2)
+        crop_x = int(first_kf.center_x * in_w - crop_w / 2)
+        crop_y = int(first_kf.center_y * in_h - crop_h / 2)
 
         # Clamp to valid range
-        crop_x = max(0, min(crop_x, in_w - out_w))
-        crop_y = max(0, min(crop_y, in_h - out_h))
+        crop_x = max(0, min(crop_x, in_w - crop_w))
+        crop_y = max(0, min(crop_y, in_h - crop_h))
 
-        logger.info(f"Using static crop at ({crop_x}, {crop_y}) for {out_w}x{out_h} output")
-        return f"crop={out_w}:{out_h}:{crop_x}:{crop_y}"
+        logger.info(f"Using static crop at ({crop_x}, {crop_y}) for {crop_w}x{crop_h} crop")
+        return f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
 
     def build_position_expression(self, positions: List[float], timestamps: List[float], input_size: int, output_size: int) -> str:
         """Build FFmpeg expression for position interpolation"""
@@ -172,6 +185,7 @@ class FFmpegService:
         self,
         input_path: str,
         keyframes: List[CropKeyframe],
+        crop_w: int, crop_h: int,
         out_w: int, out_h: int,
         quality: Dict
     ) -> str:
@@ -192,12 +206,12 @@ class FFmpegService:
                     if segment['type'] == 'static':
                         # Static crop for this segment
                         await self.create_static_segment(
-                            input_path, segment, segment_file, out_w, out_h, quality
+                            input_path, segment, segment_file, crop_w, crop_h, out_w, out_h, quality
                         )
                     else:
                         # Smooth pan segment
                         await self.create_smooth_segment(
-                            input_path, segment, segment_file, out_w, out_h, quality
+                            input_path, segment, segment_file, crop_w, crop_h, out_w, out_h, quality
                         )
 
                     # Only add to list if file was actually created
@@ -261,7 +275,7 @@ class FFmpegService:
 
     async def create_static_segment(
         self, input_path: str, segment: Dict, output_path: str,
-        out_w: int, out_h: int, quality: Dict
+        crop_w: int, crop_h: int, out_w: int, out_h: int, quality: Dict
     ):
         """Create segment with static crop"""
 
@@ -277,19 +291,19 @@ class FFmpegService:
 
         # Calculate crop position
         metadata = await self.get_video_metadata(input_path)
-        crop_x = int(kf.center_x * metadata['width'] - out_w / 2)
-        crop_y = int(kf.center_y * metadata['height'] - out_h / 2)
+        crop_x = int(kf.center_x * metadata['width'] - crop_w / 2)
+        crop_y = int(kf.center_y * metadata['height'] - crop_h / 2)
 
         # Clamp to valid range
-        crop_x = max(0, min(crop_x, metadata['width'] - out_w))
-        crop_y = max(0, min(crop_y, metadata['height'] - out_h))
+        crop_x = max(0, min(crop_x, metadata['width'] - crop_w))
+        crop_y = max(0, min(crop_y, metadata['height'] - crop_h))
 
         cmd = [
             'ffmpeg',
             '-i', input_path,
             '-ss', str(segment['start_time']),
             '-t', str(duration),
-            '-vf', f"crop={out_w}:{out_h}:{crop_x}:{crop_y}",
+            '-vf', f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={out_w}:{out_h}",
             '-c:v', 'libx264',
             '-crf', str(quality['crf']),
             '-preset', quality['preset'],
@@ -303,7 +317,7 @@ class FFmpegService:
 
     async def create_smooth_segment(
         self, input_path: str, segment: Dict, output_path: str,
-        out_w: int, out_h: int, quality: Dict
+        crop_w: int, crop_h: int, out_w: int, out_h: int, quality: Dict
     ):
         """Create segment with smooth interpolation"""
 
@@ -321,15 +335,18 @@ class FFmpegService:
         crop_filter = self.generate_smooth_crop_filter(
             segment['keyframes'],
             metadata['width'], metadata['height'],
-            out_w, out_h
+            crop_w, crop_h
         )
+
+        # Add scaling after cropping
+        video_filter = f"{crop_filter},scale={out_w}:{out_h}"
 
         cmd = [
             'ffmpeg',
             '-i', input_path,
             '-ss', str(segment['start_time']),
             '-t', str(duration),
-            '-vf', crop_filter,
+            '-vf', video_filter,
             '-c:v', 'libx264',
             '-crf', str(quality['crf']),
             '-preset', quality['preset'],
@@ -436,14 +453,91 @@ class FFmpegService:
         if not video_stream:
             raise ValueError("No video stream found")
 
+        # Parse frame rate more safely
+        fps_string = video_stream.get('r_frame_rate', '24/1')
+        if '/' in fps_string:
+            numerator, denominator = fps_string.split('/')
+            fps = float(numerator) / float(denominator) if float(denominator) != 0 else 24.0
+        else:
+            fps = float(fps_string) if fps_string else 24.0
+
+        # Calculate frame count from duration and fps
+        duration = float(data['format']['duration'])
+        frame_count = int(duration * fps)
+
+        # Try to get more accurate frame count from nb_frames if available
+        if 'nb_frames' in video_stream:
+            try:
+                accurate_frame_count = int(video_stream['nb_frames'])
+                if accurate_frame_count > 0:
+                    logger.debug(f"Using nb_frames for accurate count: {accurate_frame_count} vs calculated {frame_count}")
+                    frame_count = accurate_frame_count
+            except (ValueError, TypeError):
+                logger.debug("nb_frames not available or invalid, using calculated frame count")
+
+        # Validate values
+        if fps <= 0:
+            logger.warning(f"Invalid fps ({fps}) detected, using default 24.0")
+            fps = 24.0
+            frame_count = int(duration * fps)
+
+        if frame_count <= 0:
+            logger.warning(f"Invalid frame count ({frame_count}) detected, recalculating")
+            frame_count = int(duration * fps)
+
+        # Final validation - if frame count is still suspect, try direct counting (slow but accurate)
+        if frame_count <= 0 or (duration > 0 and abs(frame_count / fps - duration) > 1.0):
+            logger.warning(f"Frame count seems incorrect ({frame_count}), attempting direct count...")
+            try:
+                direct_frame_count = await self.count_frames_directly(video_path)
+                if direct_frame_count > 0:
+                    logger.info(f"Direct frame count: {direct_frame_count} (was {frame_count})")
+                    frame_count = direct_frame_count
+            except Exception as e:
+                logger.warning(f"Direct frame counting failed: {e}, keeping estimated count")
+
+        logger.info(f"Video metadata: {int(video_stream['width'])}x{int(video_stream['height'])}, {fps:.2f}fps, {duration:.2f}s, {frame_count} frames")
+
         return {
             'width': int(video_stream['width']),
             'height': int(video_stream['height']),
-            'fps': eval(video_stream['r_frame_rate']),
-            'duration': float(data['format']['duration']),
+            'fps': fps,
+            'duration': duration,
+            'frame_count': frame_count,
             'codec': video_stream['codec_name'],
             'bitrate': int(data['format'].get('bit_rate', 0))
         }
+
+    async def count_frames_directly(self, video_path: str) -> int:
+        """Count frames directly using ffprobe (slower but more accurate)"""
+
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-count_frames',
+            '-show_entries', 'stream=nb_frames',
+            '-csv', '=',
+            video_path
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            raise Exception(f"Frame counting failed: {stderr.decode()}")
+
+        output = stdout.decode().strip()
+        # Output format: "stream,1234" where 1234 is the frame count
+        if ',' in output:
+            return int(output.split(',')[1])
+
+        return 0
 
     async def generate_preview_overlay(
         self,

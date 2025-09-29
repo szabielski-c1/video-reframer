@@ -315,6 +315,7 @@ class VideoReframer {
                 </div>
             </div>
             ${this.generateShotStats(analytics.subject_statistics)}
+            ${this.generateShotDetectionComparison(analytics)}
         `;
 
         analyticsContent.innerHTML = analyticsHtml;
@@ -346,6 +347,100 @@ class VideoReframer {
                 <strong>Total Shots:</strong> ${totalShots}
             </div>
         `;
+
+        return html;
+    }
+
+    generateShotDetectionComparison(analytics) {
+        if (!analytics.gemini_shots && !analytics.our_keyframes) {
+            return '<p class="text-muted">No shot detection data available.</p>';
+        }
+
+        let html = '<h6 class="mt-4 mb-3">🎬 Shot Detection Analysis</h6>';
+
+        // Summary comparison
+        if (analytics.shot_detection_comparison) {
+            const comp = analytics.shot_detection_comparison;
+            html += `
+                <div class="row mb-3">
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-body">
+                                <h6 class="card-title">📊 Detection Summary</h6>
+                                <div class="analytics-stat"><strong>Gemini Shots:</strong> ${comp.gemini_shot_count}</div>
+                                <div class="analytics-stat"><strong>Our Keyframes:</strong> ${comp.our_keyframe_count}</div>
+                                <div class="analytics-stat"><strong>Cut Points:</strong> ${comp.cut_count}</div>
+                                <div class="analytics-stat"><strong>Avg Shot Duration:</strong> ${comp.avg_shot_duration}s</div>
+                                <div class="analytics-stat"><strong>Shortest Shot:</strong> ${comp.shortest_shot}s</div>
+                                <div class="analytics-stat"><strong>Longest Shot:</strong> ${comp.longest_shot}s</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Detailed shot list (show first 15 shots with crop data)
+        if (analytics.gemini_shots && analytics.gemini_shots.length > 0) {
+            html += `
+                <h6 class="mt-3 mb-2">🤖 Gemini AI Shot Detection & Crop Analysis (First 15)</h6>
+                <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                    <table class="table table-sm table-striped">
+                        <thead class="table-dark">
+                            <tr>
+                                <th>#</th>
+                                <th>Time Range</th>
+                                <th>Duration</th>
+                                <th>Crop Center</th>
+                                <th>Strategy</th>
+                                <th>Primary Subjects</th>
+                                <th>AI Reasoning</th>
+                                <th>Confidence</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+
+            analytics.gemini_shots.slice(0, 15).forEach(shot => {
+                const subjects = shot.primary_subjects && shot.primary_subjects.length > 0
+                    ? shot.primary_subjects.join(', ')
+                    : 'None specified';
+
+                const centerPos = `(${shot.crop_center_x}, ${shot.crop_center_y})`;
+                const timeRange = `${shot.start_time}s - ${shot.end_time}s`;
+
+                html += `
+                    <tr>
+                        <td><strong>${shot.shot_number}</strong></td>
+                        <td><small>${timeRange}</small></td>
+                        <td>${shot.duration}s</td>
+                        <td><code>${centerPos}</code></td>
+                        <td><span class="badge bg-secondary">${shot.strategy.replace(/_/g, ' ')}</span></td>
+                        <td><small class="text-primary">${subjects}</small></td>
+                        <td><small class="text-muted">${shot.reasoning}</small></td>
+                        <td><span class="badge ${shot.confidence > 0.8 ? 'bg-success' : shot.confidence > 0.6 ? 'bg-warning' : 'bg-danger'}">${(shot.confidence * 100).toFixed(0)}%</span></td>
+                    </tr>
+                    ${shot.description ? `
+                    <tr class="table-light">
+                        <td colspan="8"><small><em>📝 ${shot.description}</em></small></td>
+                    </tr>
+                    ` : ''}
+                `;
+            });
+
+            html += `
+                        </tbody>
+                    </table>
+                </div>
+                ${analytics.gemini_shots.length > 15 ? `<small class="text-muted">Showing 15 of ${analytics.gemini_shots.length} shots</small>` : ''}
+
+                <div class="mt-2">
+                    <small class="text-muted">
+                        <strong>Crop Center:</strong> (0,0) = top-left, (0.5,0.5) = center, (1,1) = bottom-right
+                    </small>
+                </div>
+            `;
+        }
 
         return html;
     }

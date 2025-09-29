@@ -397,6 +397,39 @@ class VideoProcessor:
             strategy = shot.get('crop_strategy', 'unknown')
             shot_stats['shot_strategies'][strategy] = shot_stats['shot_strategies'].get(strategy, 0) + 1
 
+        # Create detailed shot breakdown for comparison
+        gemini_shots = []
+        for i, shot in enumerate(shots):
+            crop_center = shot.get('crop_center', [0.5, 0.5])
+            primary_subjects = shot.get('primary_subjects', [])
+
+            gemini_shots.append({
+                'shot_number': i + 1,
+                'start_time': round(shot['start_time'], 3),
+                'end_time': round(shot['end_time'], 3),
+                'duration': round(shot['duration'], 3),
+                'strategy': shot.get('crop_strategy', 'unknown'),
+                'confidence': round(shot.get('confidence', 0), 2),
+                'description': shot.get('shot_description', '')[:80],  # Show more description
+                'crop_center_x': round(crop_center[0], 3) if len(crop_center) > 0 else 0.5,
+                'crop_center_y': round(crop_center[1], 3) if len(crop_center) > 1 else 0.5,
+                'primary_subjects': primary_subjects[:3] if primary_subjects else [],  # Show up to 3 subjects
+                'reasoning': self.generate_crop_reasoning(shot, crop_center, primary_subjects)
+            })
+
+        # Create keyframe breakdown to show our processing
+        our_keyframes = []
+        for i, kf in enumerate(keyframes):
+            our_keyframes.append({
+                'keyframe_number': i + 1,
+                'timestamp': round(kf.timestamp, 3),
+                'center_x': round(kf.center_x, 3),
+                'center_y': round(kf.center_y, 3),
+                'is_cut': kf.is_cut,
+                'confidence': round(kf.confidence, 2),
+                'reason': kf.reason[:50]  # Truncate for display
+            })
+
         return {
             'input_duration': metadata['duration'],
             'input_resolution': f"{metadata['width']}x{metadata['height']}",
@@ -409,8 +442,64 @@ class VideoProcessor:
             'subject_statistics': shot_stats,  # Frontend expects 'subject_statistics'
             'shot_statistics': shot_stats,     # Keep this for backwards compatibility
             'processing_approach': 'video_upload_analysis',
-            'processing_time': (datetime.utcnow() - datetime.utcnow()).total_seconds()  # Would track actual time
+            'processing_time': (datetime.utcnow() - datetime.utcnow()).total_seconds(),  # Would track actual time
+            # New detailed comparison data
+            'gemini_shots': gemini_shots,
+            'our_keyframes': our_keyframes,
+            'shot_detection_comparison': {
+                'gemini_shot_count': len(shots),
+                'our_keyframe_count': len(keyframes),
+                'cut_count': total_cuts,
+                'avg_shot_duration': round(sum(shot['duration'] for shot in shots) / len(shots) if shots else 0, 3),
+                'shortest_shot': round(min(shot['duration'] for shot in shots) if shots else 0, 3),
+                'longest_shot': round(max(shot['duration'] for shot in shots) if shots else 0, 3)
+            }
         }
+
+    def generate_crop_reasoning(self, shot: Dict, crop_center: List[float], primary_subjects: List[str]) -> str:
+        """Generate human-readable reasoning for crop center choice"""
+
+        center_x, center_y = crop_center[0] if len(crop_center) > 0 else 0.5, crop_center[1] if len(crop_center) > 1 else 0.5
+        strategy = shot.get('crop_strategy', 'unknown')
+
+        # Determine position description
+        if center_x < 0.3:
+            h_pos = "left"
+        elif center_x > 0.7:
+            h_pos = "right"
+        else:
+            h_pos = "center"
+
+        if center_y < 0.3:
+            v_pos = "top"
+        elif center_y > 0.7:
+            v_pos = "bottom"
+        else:
+            v_pos = "middle"
+
+        position = f"{v_pos}-{h_pos}" if v_pos != "middle" or h_pos != "center" else "center"
+
+        # Build reasoning based on strategy and subjects
+        reasoning_parts = []
+
+        if primary_subjects:
+            subject_text = ", ".join(primary_subjects[:2])
+            reasoning_parts.append(f"Focus on {subject_text}")
+
+        if strategy == "follow_subject":
+            reasoning_parts.append("tracking movement")
+        elif strategy == "track_speaker":
+            reasoning_parts.append("keeping speaker in frame")
+        elif strategy == "static_center":
+            reasoning_parts.append("static composition")
+        elif strategy == "pan_left_to_right":
+            reasoning_parts.append("following camera pan")
+        elif strategy == "zoom_in" or strategy == "zoom_out":
+            reasoning_parts.append("handling zoom movement")
+
+        reasoning_parts.append(f"positioned {position}")
+
+        return "; ".join(reasoning_parts)
 
     async def generate_preview(self, video_path: str, keyframes: List[CropKeyframe], job_id: str) -> str:
         """Generate preview video with overlay"""

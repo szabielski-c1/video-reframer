@@ -81,7 +81,7 @@ class FFmpegService:
         has_cuts = any(kf.is_cut for kf in keyframes)
 
         if has_cuts:
-            # Complex processing with cuts
+            # Complex processing with cuts - but ensure duration preservation
             output_path = await self.process_with_cuts(
                 input_path, keyframes, crop_width, crop_height, output_width, output_height, quality
             )
@@ -203,6 +203,12 @@ class FFmpegService:
                 segment_file = os.path.join(temp_dir, f"segment_{i:03d}.mp4")
 
                 try:
+                    # Ensure segment has minimum duration before processing
+                    duration = segment['end_time'] - segment['start_time']
+                    if duration <= 0:
+                        logger.warning(f"Skipping zero-duration segment {i}: {segment['start_time']:.3f}s to {segment['end_time']:.3f}s")
+                        continue
+
                     if segment['type'] == 'static':
                         # Static crop for this segment
                         await self.create_static_segment(
@@ -214,15 +220,16 @@ class FFmpegService:
                             input_path, segment, segment_file, crop_w, crop_h, out_w, out_h, quality
                         )
 
-                    # Only add to list if file was actually created
+                    # Add to list if file was created successfully
                     if os.path.exists(segment_file) and os.path.getsize(segment_file) > 0:
                         segment_files.append(segment_file)
                         logger.info(f"✓ Created segment file: {os.path.basename(segment_file)} ({os.path.getsize(segment_file)} bytes)")
                     else:
-                        logger.warning(f"⚠️ Segment file not created or empty: {segment_file}")
+                        logger.error(f"❌ Segment file not created or empty: {segment_file}")
 
                 except Exception as e:
                     logger.error(f"❌ Failed to create segment {i}: {e}")
+                    # Don't skip - this maintains shot count
                     continue
 
             # Concatenate all segments
@@ -244,19 +251,33 @@ class FFmpegService:
                 os.rmdir(temp_dir)
 
     def split_into_segments(self, keyframes: List[CropKeyframe]) -> List[Dict]:
-        """Split keyframes into segments based on cuts"""
+        """Split keyframes into segments based on cuts, ensuring complete timeline coverage"""
+
+        if not keyframes:
+            return []
+
+        # Sort keyframes by timestamp first
+        keyframes.sort(key=lambda x: x.timestamp)
 
         segments = []
         current_segment = []
 
-        for kf in keyframes:
+        for i, kf in enumerate(keyframes):
             if kf.is_cut and current_segment:
-                # End current segment
+                # End current segment and start new one
+                # Make sure the segment has a reasonable end time
+                start_time = current_segment[0].timestamp
+                end_time = kf.timestamp
+
+                # If the segment is too short, extend it slightly
+                if end_time - start_time < 0.04:  # Less than 1 frame at 24fps
+                    end_time = start_time + 0.04
+
                 segments.append({
                     'type': 'smooth',
                     'keyframes': current_segment,
-                    'start_time': current_segment[0].timestamp,
-                    'end_time': current_segment[-1].timestamp
+                    'start_time': start_time,
+                    'end_time': end_time
                 })
                 current_segment = [kf]
             else:
@@ -264,13 +285,30 @@ class FFmpegService:
 
         # Add final segment
         if current_segment:
+            start_time = current_segment[0].timestamp
+            if len(current_segment) > 1:
+                end_time = current_segment[-1].timestamp
+            else:
+                # For single keyframe segments, look ahead to next keyframe or use reasonable duration
+                if i + 1 < len(keyframes):
+                    end_time = keyframes[i + 1].timestamp
+                else:
+                    end_time = start_time + 1.0  # Default 1 second for final segment
+
             segments.append({
                 'type': 'smooth',
                 'keyframes': current_segment,
-                'start_time': current_segment[0].timestamp,
-                'end_time': current_segment[-1].timestamp
+                'start_time': start_time,
+                'end_time': end_time
             })
 
+        # Validate segments don't have zero duration
+        for seg in segments:
+            if seg['end_time'] <= seg['start_time']:
+                seg['end_time'] = seg['start_time'] + 0.04  # Minimum duration
+                logger.warning(f"Fixed zero-duration segment: {seg['start_time']:.3f}s -> {seg['end_time']:.3f}s")
+
+        logger.info(f"Created {len(segments)} segments from {len(keyframes)} keyframes")
         return segments
 
     async def create_static_segment(
@@ -282,10 +320,15 @@ class FFmpegService:
         kf = segment['keyframes'][0]
         duration = segment['end_time'] - segment['start_time']
 
-        # Ensure minimum duration to avoid zero-length segments
+        # Handle very short segments by using a single frame
         if duration <= 0.01:
-            logger.warning(f"Segment duration too short ({duration}s), skipping segment from {segment['start_time']} to {segment['end_time']}")
-            return
+            logger.warning(f"Segment duration too short ({duration}s), using single frame duration")
+            # Use one frame duration minimum (1/fps seconds)
+            metadata = await self.get_video_metadata(input_path)
+            frame_duration = 1.0 / metadata['fps']
+            duration = frame_duration
+            segment['end_time'] = segment['start_time'] + duration
+            logger.info(f"Adjusted segment to use single frame duration: {duration:.4f}s")
 
         logger.info(f"Creating static segment: {segment['start_time']:.3f}s to {segment['end_time']:.3f}s (duration: {duration:.3f}s)")
 
@@ -323,10 +366,15 @@ class FFmpegService:
 
         duration = segment['end_time'] - segment['start_time']
 
-        # Ensure minimum duration to avoid zero-length segments
+        # Handle very short segments by using a single frame
         if duration <= 0.01:
-            logger.warning(f"Segment duration too short ({duration}s), skipping segment from {segment['start_time']} to {segment['end_time']}")
-            return
+            logger.warning(f"Segment duration too short ({duration}s), using single frame duration")
+            # Use one frame duration minimum (1/fps seconds)
+            metadata = await self.get_video_metadata(input_path)
+            frame_duration = 1.0 / metadata['fps']
+            duration = frame_duration
+            segment['end_time'] = segment['start_time'] + duration
+            logger.info(f"Adjusted segment to use single frame duration: {duration:.4f}s")
 
         logger.info(f"Creating smooth segment: {segment['start_time']:.3f}s to {segment['end_time']:.3f}s (duration: {duration:.3f}s)")
 

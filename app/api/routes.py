@@ -206,6 +206,68 @@ async def list_jobs(
         'offset': offset
     }
 
+@router.get("/jobs/recent/completed")
+async def get_recent_completed_jobs(
+    limit: int = 10,
+    redis=Depends(get_redis)
+):
+    """Get recent completed jobs with full analytics data"""
+
+    # Get all job keys
+    job_keys = await redis.keys("job:*")
+
+    # Get completed jobs with full data
+    completed_jobs = []
+    for key in job_keys:
+        job_data = await redis.hgetall(key)
+        if job_data and job_data.get('status') == 'completed':
+            # Parse analytics if available
+            analytics = None
+            if job_data.get('analytics'):
+                try:
+                    analytics = json.loads(job_data['analytics'])
+                except json.JSONDecodeError:
+                    pass
+
+            # Extract original filename from request if available
+            original_filename = "Unknown"
+            if job_data.get('request'):
+                try:
+                    request_data = json.loads(job_data['request'])
+                    input_url = request_data.get('input_url', '')
+                    # Extract filename from URL
+                    if input_url:
+                        original_filename = input_url.split('/')[-1].replace('%20', ' ')
+                        # Remove file extension for display
+                        if '.' in original_filename:
+                            original_filename = original_filename.rsplit('.', 1)[0]
+                except json.JSONDecodeError:
+                    pass
+
+            completed_jobs.append({
+                'job_id': job_data['job_id'],
+                'status': job_data['status'],
+                'created_at': job_data.get('created_at'),
+                'updated_at': job_data.get('updated_at'),
+                'output_url': job_data.get('output_url'),
+                'preview_url': job_data.get('preview_url'),
+                'original_filename': original_filename,
+                'analytics': analytics,
+                'progress': float(job_data.get('progress', 0)),
+                'message': job_data.get('message', '')
+            })
+
+    # Sort by updated_at (newest first)
+    completed_jobs.sort(key=lambda x: x.get('updated_at', ''), reverse=True)
+
+    # Apply limit
+    completed_jobs = completed_jobs[:limit]
+
+    return {
+        'jobs': completed_jobs,
+        'total': len(completed_jobs)
+    }
+
 @router.post("/jobs/{job_id}/retry")
 async def retry_job(
     job_id: str,

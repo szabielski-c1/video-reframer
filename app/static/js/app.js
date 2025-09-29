@@ -10,6 +10,7 @@ class VideoReframer {
         this.initializeEventListeners();
         this.setupDragAndDrop();
         this.startHealthMonitoring();
+        this.loadRecentJobs();
     }
 
     initializeEventListeners() {
@@ -586,6 +587,146 @@ class VideoReframer {
             uploadButton.disabled = !allowUploads;
             uploadButton.title = allowUploads ? '' : 'AI service unavailable';
         }
+    }
+
+    async loadRecentJobs() {
+        const recentJobsContent = document.getElementById('recent-jobs-content');
+
+        try {
+            // Show loading state
+            recentJobsContent.innerHTML = `
+                <div class="text-center py-4">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p class="mt-2 text-muted">Loading recent jobs...</p>
+                </div>
+            `;
+
+            const response = await fetch('/api/v1/jobs/recent/completed');
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            this.displayRecentJobs(data.jobs);
+
+        } catch (error) {
+            console.error('Error loading recent jobs:', error);
+            recentJobsContent.innerHTML = `
+                <div class="text-center py-4">
+                    <i class="bi bi-exclamation-triangle text-warning fs-1"></i>
+                    <p class="mt-2 text-muted">Error loading recent jobs</p>
+                    <button class="btn btn-outline-primary btn-sm" onclick="app.loadRecentJobs()">
+                        <i class="bi bi-arrow-clockwise"></i> Retry
+                    </button>
+                </div>
+            `;
+        }
+    }
+
+    displayRecentJobs(jobs) {
+        const recentJobsContent = document.getElementById('recent-jobs-content');
+
+        if (!jobs || jobs.length === 0) {
+            recentJobsContent.innerHTML = `
+                <div class="text-center py-4">
+                    <i class="bi bi-inbox text-muted fs-1"></i>
+                    <p class="mt-2 text-muted">No completed jobs yet. Upload a video to get started!</p>
+                </div>
+            `;
+            return;
+        }
+
+        let html = '';
+        jobs.forEach((job, index) => {
+            // Format date
+            const updatedDate = job.updated_at ? new Date(job.updated_at).toLocaleString() : 'Unknown';
+
+            // Get analytics summary
+            const analyticsSummary = this.getAnalyticsSummary(job.analytics);
+
+            html += `
+                <div class="job-item mb-3 p-3 border rounded">
+                    <div class="row align-items-center">
+                        <div class="col-md-6">
+                            <h6 class="mb-1">
+                                <i class="bi bi-film"></i> ${job.original_filename}
+                            </h6>
+                            <small class="text-muted">
+                                <i class="bi bi-clock"></i> Completed: ${updatedDate}
+                            </small>
+                            ${analyticsSummary}
+                        </div>
+                        <div class="col-md-6 text-end">
+                            ${job.output_url ? `
+                                <a href="${job.output_url}" class="btn btn-primary btn-sm me-2" download>
+                                    <i class="bi bi-download"></i> Download
+                                </a>
+                            ` : ''}
+                            <button class="btn btn-outline-info btn-sm" onclick="app.showJobAnalytics('${job.job_id}', ${index})" data-bs-toggle="collapse" data-bs-target="#job-analytics-${index}">
+                                <i class="bi bi-graph-up"></i> View Analysis
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Analytics Details (Collapsible) -->
+                    <div class="collapse mt-3" id="job-analytics-${index}">
+                        <div class="analytics-detail-content">
+                            ${job.analytics ? this.generateJobAnalytics(job.analytics) : '<p class="text-muted">No analytics available</p>'}
+                        </div>
+                    </div>
+                </div>
+            `;
+        });
+
+        recentJobsContent.innerHTML = html;
+    }
+
+    getAnalyticsSummary(analytics) {
+        if (!analytics) return '';
+
+        const stats = [];
+        if (analytics.shots_analyzed) stats.push(`${analytics.shots_analyzed} shots`);
+        if (analytics.total_cuts) stats.push(`${analytics.total_cuts} cuts`);
+        if (analytics.input_duration) stats.push(`${Math.round(analytics.input_duration)}s duration`);
+
+        return stats.length > 0 ? `<div><small class="text-info">${stats.join(' • ')}</small></div>` : '';
+    }
+
+    generateJobAnalytics(analytics) {
+        if (!analytics) return '<p class="text-muted">No analytics available</p>';
+
+        // Reuse the existing analytics generation methods
+        let html = '<h6 class="mb-3">📊 Processing Summary</h6>';
+
+        // Basic stats
+        html += `
+            <div class="row mb-3">
+                <div class="col-md-6">
+                    <div class="analytics-stat"><strong>Input Duration:</strong> ${analytics.input_duration || 'N/A'}s</div>
+                    <div class="analytics-stat"><strong>Input Resolution:</strong> ${analytics.input_resolution || 'N/A'}</div>
+                    <div class="analytics-stat"><strong>Output Resolution:</strong> ${analytics.output_resolution || 'N/A'}</div>
+                </div>
+                <div class="col-md-6">
+                    <div class="analytics-stat"><strong>Shots Analyzed:</strong> ${analytics.shots_analyzed || 'N/A'}</div>
+                    <div class="analytics-stat"><strong>Total Keyframes:</strong> ${analytics.total_keyframes || 'N/A'}</div>
+                    <div class="analytics-stat"><strong>Average Confidence:</strong> ${analytics.average_confidence ? (analytics.average_confidence * 100).toFixed(1) + '%' : 'N/A'}</div>
+                </div>
+            </div>
+        `;
+
+        // Add shot detection comparison if available
+        if (analytics.gemini_shots || analytics.shot_detection_comparison) {
+            html += this.generateShotDetectionComparison(analytics);
+        }
+
+        return html;
+    }
+
+    showJobAnalytics(jobId, index) {
+        // This method can be extended to load more detailed analytics if needed
+        console.log(`Showing analytics for job ${jobId}`);
     }
 }
 

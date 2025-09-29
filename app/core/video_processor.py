@@ -112,15 +112,24 @@ class VideoProcessor:
             # Upload to S3
             await self.update_job_status(job_id, JobStatus.UPLOADING, 90.0, "Uploading result to S3")
             output_url = await self.upload_result(output_path, request, job_id)
+            logger.info(f"✅ Upload completed successfully. Output URL: {output_url}")
             await self.update_job_status(job_id, JobStatus.UPLOADING, 95.0, "Upload complete, finalizing")
 
             # Generate analytics
             await self.update_job_status(job_id, JobStatus.UPLOADING, 97.0, "Generating analytics")
+            logger.info(f"🔍 Starting analytics generation for job {job_id}")
             analytics = self.generate_analytics_from_shots(reframing_data['shots'], crop_keyframes, metadata)
+            logger.info(f"✅ Analytics generation completed for job {job_id}")
 
             # Complete job
             await self.update_job_status(job_id, JobStatus.UPLOADING, 99.0, "Finishing up")
-            await self.complete_job(job_id, output_url, preview_url, analytics)
+            logger.info(f"🏁 Completing job {job_id} with output URL: {output_url}")
+            try:
+                await self.complete_job(job_id, output_url, preview_url, analytics)
+                logger.info(f"✅ Job {job_id} completed successfully")
+            except Exception as e:
+                logger.error(f"❌ Failed to complete job {job_id}: {e}")
+                raise
 
             # Send webhook if provided
             if request.webhook_url:
@@ -517,7 +526,8 @@ class VideoProcessor:
         if request.output_key:
             output_key = request.output_key
         else:
-            output_key = f"output/{job_id}_reframed.mp4"
+            # Fallback: put directly in reframe folder with job ID
+            output_key = f"reframe/{job_id}_reframed.mp4"
 
         output_url = await self.s3.upload_file(output_path, output_key, bucket=request.output_bucket)
         return output_url

@@ -83,8 +83,10 @@ async def upload_and_reframe(
         except (json.JSONDecodeError, ValueError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid settings: {e}")
 
-        # Create reframe request
-        output_key = f"output/{job_id}/reframed_{video.filename}"
+        # Create reframe request - put directly in reframe folder with unique ID in filename
+        # Extract base filename without extension
+        filename_base = video.filename.rsplit('.', 1)[0] if '.' in video.filename else video.filename
+        output_key = f"reframe/{job_id}_{filename_base}_reframed.mp4"
 
         reframe_request = ReframeRequest(
             input_url=input_url,

@@ -599,21 +599,23 @@ class VideoProcessor:
         elif "json" in error_str and ("parsing" in error_str or "decode" in error_str):
             return "AI response format error. This may be due to content filtering. Try a different video."
 
-        # Video/FFmpeg errors
-        elif "invalid" in error_str and ("format" in error_str or "codec" in error_str):
-            return "Unsupported video format. Please use MP4, AVI, or MOV files."
-        elif "permission" in error_str or "access" in error_str:
-            return "File access error. Please try uploading the video again."
-        elif "disk" in error_str or "space" in error_str:
-            return "Insufficient storage space. Please try again later."
-
-        # Network/S3 errors
+        # Network/S3 errors - Check these FIRST to avoid misclassification
+        elif "connection" in error_str and ("closed" in error_str or "aborted" in error_str):
+            return "Upload connection interrupted. The improved retry system should handle this better now."
         elif "connection" in error_str or "network" in error_str:
             return "Network connection error. Please check your internet and try again."
         elif "timeout" in error_str:
             return "Request timeout. Your video may be too large. Try a shorter video."
         elif "s3" in error_str or "bucket" in error_str:
             return "Storage service error. Please try again later or contact support."
+
+        # Video/FFmpeg errors
+        elif "invalid" in error_str and ("format" in error_str or "codec" in error_str):
+            return "Unsupported video format. Please use MP4, AVI, or MOV files."
+        elif "permission" in error_str or "access" in error_str:
+            return "File access error. Please try uploading the video again."
+        elif ("disk" in error_str and "full" in error_str) or ("no space" in error_str):
+            return "Insufficient storage space. Please try again later."
 
         # Validation errors
         elif "duration" in error_str and "exceeds" in error_str:
